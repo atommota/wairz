@@ -14,6 +14,7 @@ import {
   GitCompareArrows,
   HelpCircle,
   Cpu,
+  FileText,
 } from 'lucide-react'
 import { Separator } from '@/components/ui/separator'
 import wairzLogo from '@/assets/wairz_full_logo.png'
@@ -50,6 +51,7 @@ const projectSubPages: ReadonlyArray<SubPage> = [
   },
   { suffix: '/rtos', label: 'RTOS Analysis', icon: Cpu, kinds: ['rtos'] },
   { suffix: '/findings', label: 'Findings', icon: ShieldAlert, kinds: ALL_KINDS },
+  { suffix: '/report', label: 'Report', icon: FileText, kinds: ALL_KINDS },
   { suffix: '/map', label: 'Component Map', icon: Network, kinds: ['linux'] },
   { suffix: '/sbom', label: 'SBOM', icon: Package, kinds: ['linux'] },
   { suffix: '/emulation', label: 'Emulation (experimental)', icon: PlayCircle, kinds: ['linux'] },

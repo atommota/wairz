@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.config import get_settings
-from app.routers import analysis, comparison, component_map, documents, emulation, export_import, files, findings, firmware, fuzzing, kernels, projects, sbom, terminal, uart
+from app.routers import analysis, comparison, component_map, documents, emulation, export_import, files, findings, firmware, fuzzing, kernels, projects, reports, sbom, terminal, uart
 from app.services.carving_service import CarvingService
 from app.utils.sandbox import PathTraversalError
 
@@ -67,6 +67,7 @@ app.include_router(files.router)
 app.include_router(analysis.router)
 app.include_router(component_map.router)
 app.include_router(findings.router)
+app.include_router(reports.router)
 app.include_router(documents.router)
 app.include_router(sbom.router)
 app.include_router(terminal.router)
