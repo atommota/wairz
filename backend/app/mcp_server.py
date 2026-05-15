@@ -408,10 +408,15 @@ async def _load_project_state(
 
 
 async def run_server(
-    project_id: uuid.UUID,
+    project_id: uuid.UUID | None,
     firmware_id: uuid.UUID | None = None,
 ) -> None:
-    """Start the MCP server for a given project."""
+    """Start the MCP server.
+
+    When *project_id* is None the server starts with no active project; the
+    agent is expected to call list_projects + switch_project to pick one
+    before invoking analysis tools.
+    """
     settings = get_settings()
 
     # Create a standalone async engine (not sharing the FastAPI module-level one)
@@ -433,77 +438,85 @@ async def run_server(
     # switch_project updates it in-place.
     state = ProjectState()
 
-    # Load initial project
-    try:
-        firmware_count = await _load_project_state(
-            session_factory, project_id, state, host_storage_root, firmware_id
-        )
-    except ValueError as exc:
-        logger.error(str(exc))
-        sys.exit(1)
-
-    if not state.firmware_loaded:
-        if firmware_count == 0:
-            logger.warning(
-                "Project '%s' has no firmware uploaded. The MCP server will start, "
-                "but analysis tools will not work until firmware is uploaded and "
-                "unpacked. Use the Wairz web UI or POST /api/v1/projects/%s/firmware "
-                "to upload firmware.",
-                state.project_name,
-                project_id,
-            )
-        else:
-            logger.warning(
-                "Project '%s' has %d firmware(s), but none have been unpacked. "
-                "The MCP server will start, but analysis tools will not work until "
-                "firmware is unpacked. Trigger unpack via the web UI or "
-                "POST /api/v1/projects/%s/firmware/<id>/unpack.",
-                state.project_name,
-                firmware_count,
-                project_id,
-            )
-    else:
-        if firmware_count > 1 and firmware_id is None:
-            logger.info(
-                "Project has %d firmware versions; selected '%s' (%s) as the active firmware. "
-                "Pass --firmware-id <uuid> to select a different one, or use the "
-                "list_firmware_versions MCP tool to see all versions.",
-                firmware_count,
-                state.firmware_filename,
-                state.firmware_id,
-            )
-
-        # RTOS/unknown firmware has no rootfs — skip the directory check and
-        # rely on storage_path instead. We still validate when extracted_path
-        # is set (Linux case).
-        if state.extracted_path and not os.path.isdir(state.extracted_path):
-            logger.error(
-                "Extracted firmware path does not exist: %s",
-                state.extracted_path,
-            )
-            logger.error(
-                "The database stores Docker-internal paths. To fix this, either:\n"
-                "  1. Run the MCP server inside Docker:\n"
-                "     docker exec -i wairz-backend-1 uv run wairz-mcp --project-id %s\n"
-                "  2. Set STORAGE_ROOT in .env to point to a local copy of the firmware data",
-                project_id,
-            )
-            sys.exit(1)
-        if not state.extracted_path and state.storage_path and not os.path.isfile(state.storage_path):
-            logger.error(
-                "Firmware storage path does not exist: %s",
-                state.storage_path,
-            )
-            sys.exit(1)
-
+    # Load initial project, if one was specified. When project_id is None the
+    # server boots in "no project" mode — the agent must use list_projects +
+    # switch_project before any analysis tool can be called.
+    if project_id is None:
         logger.info(
-            "Loaded project '%s' — firmware: %s (%s, %s)",
-            state.project_name,
-            state.firmware_filename,
-            state.architecture or "unknown arch",
-            state.endianness or "unknown endian",
+            "Starting with no active project. Use list_projects and "
+            "switch_project to select one."
         )
-        logger.info("Firmware root: %s", state.extracted_path)
+    else:
+        try:
+            firmware_count = await _load_project_state(
+                session_factory, project_id, state, host_storage_root, firmware_id
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+
+        if not state.firmware_loaded:
+            if firmware_count == 0:
+                logger.warning(
+                    "Project '%s' has no firmware uploaded. The MCP server will start, "
+                    "but analysis tools will not work until firmware is uploaded and "
+                    "unpacked. Use the Wairz web UI or POST /api/v1/projects/%s/firmware "
+                    "to upload firmware.",
+                    state.project_name,
+                    project_id,
+                )
+            else:
+                logger.warning(
+                    "Project '%s' has %d firmware(s), but none have been unpacked. "
+                    "The MCP server will start, but analysis tools will not work until "
+                    "firmware is unpacked. Trigger unpack via the web UI or "
+                    "POST /api/v1/projects/%s/firmware/<id>/unpack.",
+                    state.project_name,
+                    firmware_count,
+                    project_id,
+                )
+        else:
+            if firmware_count > 1 and firmware_id is None:
+                logger.info(
+                    "Project has %d firmware versions; selected '%s' (%s) as the active firmware. "
+                    "Pass --firmware-id <uuid> to select a different one, or use the "
+                    "list_firmware_versions MCP tool to see all versions.",
+                    firmware_count,
+                    state.firmware_filename,
+                    state.firmware_id,
+                )
+
+            # RTOS/unknown firmware has no rootfs — skip the directory check and
+            # rely on storage_path instead. We still validate when extracted_path
+            # is set (Linux case).
+            if state.extracted_path and not os.path.isdir(state.extracted_path):
+                logger.error(
+                    "Extracted firmware path does not exist: %s",
+                    state.extracted_path,
+                )
+                logger.error(
+                    "The database stores Docker-internal paths. To fix this, either:\n"
+                    "  1. Run the MCP server inside Docker:\n"
+                    "     docker exec -i wairz-backend-1 uv run wairz-mcp --project-id %s\n"
+                    "  2. Set STORAGE_ROOT in .env to point to a local copy of the firmware data",
+                    project_id,
+                )
+                sys.exit(1)
+            if not state.extracted_path and state.storage_path and not os.path.isfile(state.storage_path):
+                logger.error(
+                    "Firmware storage path does not exist: %s",
+                    state.storage_path,
+                )
+                sys.exit(1)
+
+            logger.info(
+                "Loaded project '%s' — firmware: %s (%s, %s)",
+                state.project_name,
+                state.firmware_filename,
+                state.architecture or "unknown arch",
+                state.endianness or "unknown endian",
+            )
+            logger.info("Firmware root: %s", state.extracted_path)
 
     # Build tool registry
     registry = _build_tool_registry()
@@ -512,6 +525,12 @@ async def run_server(
 
     async def _handle_get_project_info(input: dict, context: ToolContext) -> str:
         """Return info about the currently active project."""
+        if state.project_id == uuid.UUID(int=0):
+            return (
+                "No project is active. Call list_projects to see what's "
+                "available, ask the user which one they want to work on, "
+                "then call switch_project with the chosen project_id."
+            )
         lines = [
             f"Project: {state.project_name}",
             f"Project ID: {state.project_id}",
@@ -760,6 +779,16 @@ async def run_server(
         name: str, arguments: dict
     ) -> list[TextContent]:
         if not state.firmware_loaded and name not in _NO_FIRMWARE_TOOLS:
+            if state.project_id == uuid.UUID(int=0):
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Error: No project is active. Call list_projects to "
+                        "see what's available, ask the user which one they "
+                        "want to work on, then call switch_project with the "
+                        "chosen project_id before using analysis tools."
+                    ),
+                )]
             return [TextContent(
                 type="text",
                 text=(
@@ -894,9 +923,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--project-id",
-        required=True,
         type=str,
-        help="UUID of the project to analyze.",
+        default=None,
+        help=(
+            "UUID of the project to analyze. Optional — when omitted, the "
+            "server starts with no active project and the agent should call "
+            "list_projects + switch_project to pick one."
+        ),
     )
     parser.add_argument(
         "--firmware-id",
@@ -906,19 +939,27 @@ def main() -> None:
             "UUID of a specific firmware version within the project. "
             "Optional — when omitted, the earliest-uploaded unpacked firmware "
             "is selected. Use list_firmware_versions (MCP tool) or the project "
-            "detail page in the web UI to find firmware IDs."
+            "detail page in the web UI to find firmware IDs. Ignored when "
+            "--project-id is not provided."
         ),
     )
     args = parser.parse_args()
 
-    try:
-        project_id = uuid.UUID(args.project_id)
-    except ValueError:
-        print(f"Error: '{args.project_id}' is not a valid UUID.", file=sys.stderr)
-        sys.exit(1)
+    project_id: uuid.UUID | None = None
+    if args.project_id is not None:
+        try:
+            project_id = uuid.UUID(args.project_id)
+        except ValueError:
+            print(f"Error: '{args.project_id}' is not a valid UUID.", file=sys.stderr)
+            sys.exit(1)
 
     firmware_id: uuid.UUID | None = None
     if args.firmware_id is not None:
+        if project_id is None:
+            print(
+                "Error: --firmware-id requires --project-id.", file=sys.stderr
+            )
+            sys.exit(1)
         try:
             firmware_id = uuid.UUID(args.firmware_id)
         except ValueError:
