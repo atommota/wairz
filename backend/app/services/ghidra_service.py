@@ -10,6 +10,8 @@ on functions not covered in the initial batch (top 200 by size).
 """
 
 import asyncio
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -22,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.database import async_session_factory
 from app.models.analysis_cache import AnalysisCache
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,48 @@ _ARCH_MAP = {
     "PowerPC": "ppc",
     "sparc": "sparc",
 }
+
+
+_ANALYSIS_LOCK_DIR = Path(tempfile.gettempdir()) / "wairz-analysis-locks"
+
+
+def _acquire_analysis_flock(lock_path: str) -> int:
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_analysis_flock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextlib.asynccontextmanager
+async def _cross_process_analysis_lock(binary_sha256: str):
+    """Host-wide exclusive lock keyed by binary sha256.
+
+    The class-level asyncio.Event guard only dedupes coroutines within a
+    single Python process. Each MCP client connection spawns its own
+    wairz-mcp process, so concurrent connections can otherwise each
+    decide "no cache yet, I'll run Ghidra" and spawn duplicate analyses
+    against the same binary — observed in the wild as 7 parallel
+    Ghidras on a 7 MB binary, none finishing. fcntl.flock serializes
+    them at the OS level and is released automatically if a process
+    crashes, so failed analyses don't leave the binary blocked.
+    """
+    _ANALYSIS_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = str(_ANALYSIS_LOCK_DIR / f"{binary_sha256}.lock")
+    fd = await asyncio.to_thread(_acquire_analysis_flock, lock_path)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_release_analysis_flock, fd)
 
 
 def _compute_sha256(file_path: str) -> str:
@@ -431,12 +476,26 @@ class GhidraAnalysisCache:
 
         # We're responsible for running the analysis
         try:
-            # Double-check after acquiring — might have been completed
-            # between our first check and acquiring the lock
-            if not await self._is_analysis_complete(firmware_id, binary_sha256, db):
-                await self._run_full_analysis(
-                    binary_path, firmware_id, binary_sha256, db,
-                )
+            async with _cross_process_analysis_lock(binary_sha256):
+                # Re-check under the cross-process lock: another wairz-mcp
+                # process may have just finished while we were waiting.
+                # Use a fresh session so we see the latest committed state
+                # rather than the caller's transaction snapshot.
+                async with async_session_factory() as recheck_db:
+                    if await self._is_analysis_complete(
+                        firmware_id, binary_sha256, recheck_db,
+                    ):
+                        return binary_sha256
+
+                # Run the analysis on its own session and commit while
+                # still holding the flock. If we released the lock with
+                # rows only flushed (not committed), a sibling process
+                # would re-check, see no rows, and spawn another Ghidra.
+                async with async_session_factory() as analysis_db:
+                    await self._run_full_analysis(
+                        binary_path, firmware_id, binary_sha256, analysis_db,
+                    )
+                    await analysis_db.commit()
         finally:
             async with self._lock:
                 ev = self._analysis_locks.pop(binary_sha256, None)
