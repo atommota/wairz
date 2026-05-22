@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -503,6 +504,69 @@ class GhidraAnalysisCache:
                     ev.set()
 
         return binary_sha256
+
+    async def get_run_status(
+        self,
+        firmware_id: uuid.UUID,
+        binary_sha256: str,
+        db: AsyncSession,
+    ) -> dict | None:
+        """Read the most recent background-analysis run row.
+
+        Returned dict has keys: status ("running"|"complete"|"failed"),
+        started_at (epoch seconds), optional finished_at, optional pid,
+        optional error. None means no run has been kicked off via
+        start_binary_analysis (the binary may still be cached if it was
+        analyzed synchronously through a different code path).
+        """
+        return await self._get_cached(
+            firmware_id, binary_sha256, "ghidra_analysis_run", db,
+        )
+
+    async def mark_run_started(
+        self,
+        firmware_id: uuid.UUID,
+        binary_path: str,
+        binary_sha256: str,
+        pid: int,
+        db: AsyncSession,
+    ) -> None:
+        await self._store_cached(
+            firmware_id, binary_path, binary_sha256, "ghidra_analysis_run",
+            {"status": "running", "started_at": time.time(), "pid": pid},
+            db,
+        )
+
+    async def mark_run_complete(
+        self,
+        firmware_id: uuid.UUID,
+        binary_path: str,
+        binary_sha256: str,
+        db: AsyncSession,
+    ) -> None:
+        await self._store_cached(
+            firmware_id, binary_path, binary_sha256, "ghidra_analysis_run",
+            {"status": "complete", "finished_at": time.time()},
+            db,
+        )
+
+    async def mark_run_failed(
+        self,
+        firmware_id: uuid.UUID,
+        binary_path: str,
+        binary_sha256: str,
+        error: str,
+        db: AsyncSession,
+    ) -> None:
+        await self._store_cached(
+            firmware_id, binary_path, binary_sha256, "ghidra_analysis_run",
+            {
+                "status": "failed",
+                "finished_at": time.time(),
+                "error": error[:2000],
+            },
+            db,
+        )
 
     async def get_functions_if_cached(
         self,
