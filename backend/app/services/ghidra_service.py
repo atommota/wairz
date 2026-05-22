@@ -445,6 +445,27 @@ class GhidraAnalysisCache:
 
         return binary_sha256
 
+    async def get_functions_if_cached(
+        self,
+        binary_path: str,
+        firmware_id: uuid.UUID,
+        db: AsyncSession,
+    ) -> list[dict]:
+        """Like get_functions but never triggers Ghidra analysis.
+
+        Use this when function metadata is a nice-to-have annotation (e.g.
+        mapping byte-scan offsets to enclosing functions) rather than the
+        primary product of the call. Returns [] if the binary has not been
+        analyzed yet.
+        """
+        if not os.path.isfile(binary_path):
+            return []
+        binary_sha256 = await self._get_binary_sha256(binary_path)
+        if not await self._is_analysis_complete(firmware_id, binary_sha256, db):
+            return []
+        cached = await self._get_cached(firmware_id, binary_sha256, "functions", db)
+        return cached.get("functions", []) if cached else []
+
     async def get_functions(
         self,
         binary_path: str,
