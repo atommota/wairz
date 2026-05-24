@@ -218,7 +218,7 @@ def _extract_archive(archive_path: str, output_dir: str) -> None:
                 target = os.path.realpath(os.path.join(output_dir, member.name))
                 if not target.startswith(os.path.realpath(output_dir) + os.sep) and target != os.path.realpath(output_dir):
                     raise ValueError(f"Path traversal detected in archive: {member.name}")
-            tf.extractall(output_dir, filter="data")
+            tf.extractall(output_dir, filter="tar")
     elif zipfile.is_zipfile(archive_path):
         with zipfile.ZipFile(archive_path, "r") as zf:
             for info in zf.infolist():
