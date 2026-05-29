@@ -16,12 +16,22 @@ poll. Only the launch mechanism varies by backend.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def _job_name(prefix: str, *parts: str) -> str:
+    """Build a Batch-legal job name (^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$)."""
+    digest = hashlib.sha1(":".join(parts).encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}-{digest}"
 
 
 @dataclass
@@ -100,14 +110,103 @@ class LocalDispatcher(ComputeDispatcher):
         ])
 
 
+class BatchDispatcher(ComputeDispatcher):
+    """Submit the Ghidra worker as an AWS Batch job (enterprise cloud mode).
+
+    Both workers run the SAME image (it bundles Ghidra + the worker code); the
+    per-binary command is supplied as a container override, and the EFS mounts /
+    env / secrets come from the Batch job definition (Terraform). The job writes
+    its result to the EFS project store + Aurora cache, exactly like the local
+    worker, so the status/poll protocol is unchanged.
+    """
+
+    def _client(self):
+        import boto3  # lazy: only the cloud path needs boto3
+
+        region = get_settings().aws_region or None
+        return boto3.client("batch", region_name=region)
+
+    def _submit(self, job_name: str, command: list[str]) -> JobHandle:
+        settings = get_settings()
+        resp = self._client().submit_job(
+            jobName=job_name,
+            jobQueue=settings.batch_job_queue,
+            jobDefinition=settings.batch_job_definition,
+            containerOverrides={"command": command},
+        )
+        job_id = resp["jobId"]
+        logger.info("Submitted Batch job %s (%s)", job_id, job_name)
+        return JobHandle(ref=job_id)
+
+    def dispatch_analysis(
+        self, firmware_id: uuid.UUID, binary_path: str, sha256: str,
+    ) -> JobHandle:
+        return self._submit(
+            _job_name("wairz-an", sha256),
+            [
+                "python", "-m", "app.workers.run_ghidra_analysis",
+                "--firmware-id", str(firmware_id),
+                "--binary-path", binary_path,
+                "--sha256", sha256,
+            ],
+        )
+
+    def dispatch_decompile(
+        self,
+        firmware_id: uuid.UUID,
+        binary_path: str,
+        sha256: str,
+        function_name: str,
+    ) -> JobHandle:
+        return self._submit(
+            _job_name("wairz-dec", sha256, function_name),
+            [
+                "python", "-m", "app.workers.run_function_decompile",
+                "--firmware-id", str(firmware_id),
+                "--binary-path", binary_path,
+                "--sha256", sha256,
+                "--function-name", function_name,
+            ],
+        )
+
+
+# Normalized job states the status tools understand.
+def describe_batch_job_state(job_ref: str | None) -> str:
+    """Map an AWS Batch job's status to queued|starting|running|failed|
+    succeeded|unknown. Best-effort: any error → 'unknown' (the cache row, not
+    this lookup, is the source of truth for completion)."""
+    if not job_ref:
+        return "unknown"
+    try:
+        import boto3  # lazy
+
+        region = get_settings().aws_region or None
+        resp = boto3.client("batch", region_name=region).describe_jobs(
+            jobs=[job_ref],
+        )
+        jobs = resp.get("jobs", [])
+        if not jobs:
+            return "unknown"
+        status = jobs[0].get("status", "")
+        return {
+            "SUBMITTED": "queued",
+            "PENDING": "queued",
+            "RUNNABLE": "queued",
+            "STARTING": "starting",
+            "RUNNING": "running",
+            "SUCCEEDED": "succeeded",
+            "FAILED": "failed",
+        }.get(status, "unknown")
+    except Exception:
+        logger.warning("Batch describe_jobs failed for %s", job_ref, exc_info=True)
+        return "unknown"
+
+
 def get_dispatcher() -> ComputeDispatcher:
     """Return the dispatcher for the configured ``compute_backend``."""
     backend = get_settings().compute_backend
     if backend == "local":
         return LocalDispatcher()
     if backend == "aws_batch":
-        raise NotImplementedError(
-            "compute_backend='aws_batch' dispatch is not implemented yet — "
-            "it lands in enterprise Phase 2 (see enterprise/PLAN.md, change C2)."
-        )
+        return BatchDispatcher()
     raise ValueError(f"unknown compute_backend: {backend!r}")

@@ -69,14 +69,23 @@ module "cache" {
   node_type          = var.redis_node_type
 }
 
-# module "batch" {
-#   source        = "./modules/batch"
-#   name          = local.name
-#   max_vcpus     = var.batch_max_vcpus
-#   use_spot      = var.batch_use_spot
-#   efs_id        = module.storage.efs_id
-#   private_subnets = module.network.private_subnet_ids
-# }
+module "batch" {
+  source     = "./modules/batch"
+  name       = local.name
+  aws_region = var.aws_region
+  vpc_id     = module.network.vpc_id
+
+  private_subnet_ids = module.network.private_subnet_ids
+  max_vcpus          = var.batch_max_vcpus
+  use_spot           = var.batch_use_spot
+
+  efs_id                              = module.storage.efs_id
+  efs_firmware_access_point_id        = module.storage.efs_firmware_access_point_id
+  efs_ghidra_projects_access_point_id = module.storage.efs_ghidra_projects_access_point_id
+  redis_url                           = module.cache.redis_url
+  database_url_secret_arn             = module.database.database_url_secret_arn
+  secret_arns                         = [module.database.database_url_secret_arn]
+}
 
 # module "backend" {
 #   source             = "./modules/backend"

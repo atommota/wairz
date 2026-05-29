@@ -12,8 +12,9 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
 from app.ai.tool_registry import ToolContext, ToolRegistry
+from app.config import get_settings
 from app.services.analysis_service import check_binary_protections
-from app.services.compute_dispatch import get_dispatcher
+from app.services.compute_dispatch import describe_batch_job_state, get_dispatcher
 from app.services.ghidra_service import (
     decompile_function,
     get_analysis_cache,
@@ -1405,12 +1406,14 @@ async def _handle_start_binary_analysis(
 
     await cache.mark_run_started(
         context.firmware_id, path, sha256, handle.pid, context.db,
+        job_ref=handle.ref,
     )
     await context.db.commit()
 
+    worker_id = handle.ref or f"pid={handle.pid}"
     return (
         f"started - Ghidra analysis kicked off for {os.path.basename(path)} "
-        f"(pid={handle.pid}, sha256={sha256[:12]}). Poll "
+        f"({worker_id}, sha256={sha256[:12]}). Poll "
         f"check_binary_analysis_status until status=complete; multi-MB "
         f"binaries typically take 5-30 minutes on cold cache. The worker "
         f"runs independently of this MCP session, so the analysis "
@@ -1447,6 +1450,23 @@ async def _handle_check_binary_analysis_status(
     status = status_row.get("status", "unknown")
     if status == "running":
         elapsed = int(time.time() - status_row.get("started_at", 0))
+        job_ref = status_row.get("job_ref")
+        if get_settings().compute_backend != "local":
+            # Distributed worker (e.g. AWS Batch): there's no local pid to probe;
+            # ask the dispatch backend for the job's state instead. The cache
+            # completion check above remains the source of truth for "done".
+            state = describe_batch_job_state(job_ref)
+            if state == "failed":
+                return (
+                    f"failed - analysis job {job_ref} failed. Call "
+                    f"start_binary_analysis again to retry."
+                )
+            if state in ("queued", "starting"):
+                return (
+                    f"{state} - analysis job {job_ref} {state} "
+                    f"({elapsed}s since submit; cold start ~1-3 min)."
+                )
+            return f"running - {elapsed}s elapsed (job {job_ref}, {state})"
         pid = status_row.get("pid")
         # Check whether the worker is still alive — a stale "running" row
         # from a worker that crashed without writing the cache is the

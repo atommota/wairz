@@ -340,15 +340,31 @@ de-risks the cloud work. Includes version-keyed paths and LRU GC.
   3 oldest evicted, 2 newest kept. Suite: 216 passed (baseline unchanged).
 - **DoD(2a): met.**
 
-**2b — Batch module + heavy import on Batch (C2 real `SubmitJob`, C3, C5).**
-`batch` module (compute env `minvCpus=0`, Spot, `maxvCpus` ceiling; job queue;
-import job definition mounting EFS at `STORAGE_ROOT` + `GHIDRA_PROJECT_ROOT`).
-Build the Batch Ghidra image in `enterprise/docker/` (entrypoint runs the import
-worker). Redis-backed lock (C3) guards the import. **DoD(2b):** with
-`compute_backend=aws_batch`, `start_binary_analysis` submits a job, Batch scales
-0→1, imports + analyzes a test binary, persists the project to EFS, writes the
-cache row, scales to 0; `check_binary_analysis_status` reports complete; Spot
-interruption mid-import → re-run completes (idempotent).
+**2b — Batch module + heavy import on Batch (C2 real `SubmitJob`, C3, C5). ✅ code
+DONE, apply pending.** `batch` module (EC2 Spot compute env `minVcpus=0`,
+`maxVcpus` ceiling; job queue; import job definition mounting EFS at
+`STORAGE_ROOT` + `GHIDRA_PROJECT_ROOT`, secrets, awslogs; IAM
+instance/spot-fleet/execution/job roles; ECR repo). Redis lock (C3) guards the
+import.
+- **Implemented:** `modules/batch/` (validated + wired into root). C2:
+  `BatchDispatcher` in `compute_dispatch.py` (`boto3 submit_job` with per-binary
+  command override; `boto3` added to `pyproject`, lazily imported). C5:
+  `mark_run_started` stores a `job_ref`; `check_binary_analysis_status` branches
+  on `compute_backend` — Batch path maps job state via `describe_batch_job_state`
+  (queued/starting/running/failed), cache row still the completion source of
+  truth. Local path byte-identical.
+- **Reuse the backend image** as the Batch image (it bundles Ghidra + the worker
+  code); push it to the module's ECR repo (`ghidra_ecr_repository_url` output).
+  A dedicated `enterprise/docker/` slim image is optional later.
+- **Verified here:** Terraform validate/fmt clean; module imports without boto3
+  (lazy); suite 216 passed (local unchanged).
+- **DoD(2b): apply pending an AWS account** — submit→scale-0→1→import→persist→
+  cache→scale-0 and Spot-interruption-retry need a real Batch env.
+- **Known gap (follow-up):** the *function*-decompile status
+  (`check_function_decompile_status`) still uses the local pid-liveness branch;
+  in cloud mode it should mirror C5's Batch-state mapping. The decompile itself
+  works (job runs, writes cache); only intermediate polling may misreport. Low
+  risk (re-submit is idempotent). Tracked for 2c.
 
 **2c — Reuse dispatch + warm worker (C8).** Reuse runs default to one-shot
 `-process -readOnly` Batch jobs against the EFS project. Add

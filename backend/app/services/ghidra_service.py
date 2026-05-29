@@ -868,12 +868,21 @@ class GhidraAnalysisCache:
         firmware_id: uuid.UUID,
         binary_path: str,
         binary_sha256: str,
-        pid: int,
+        pid: int | None,
         db: AsyncSession,
+        job_ref: str | None = None,
     ) -> None:
+        # pid is the local worker's OS pid; job_ref is the remote job id (e.g.
+        # an AWS Batch job) when the work was dispatched off-host. Exactly one
+        # is set depending on compute_backend.
         await self._store_cached(
             firmware_id, binary_path, binary_sha256, "ghidra_analysis_run",
-            {"status": "running", "started_at": time.time(), "pid": pid},
+            {
+                "status": "running",
+                "started_at": time.time(),
+                "pid": pid,
+                "job_ref": job_ref,
+            },
             db,
         )
 

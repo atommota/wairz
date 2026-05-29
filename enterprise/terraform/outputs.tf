@@ -31,6 +31,22 @@ output "spa_bucket" {
   value       = module.storage.spa_bucket
 }
 
+# --- Phase 2b: Ghidra on Batch ----------------------------------------------
+output "batch_job_queue" {
+  description = "AWS Batch job queue for Ghidra jobs (BATCH_JOB_QUEUE)."
+  value       = module.batch.job_queue_arn
+}
+
+output "batch_import_job_definition" {
+  description = "Batch job definition for heavy Ghidra imports (BATCH_JOB_DEFINITION)."
+  value       = module.batch.import_job_definition_name
+}
+
+output "ghidra_ecr_repository_url" {
+  description = "Push the Ghidra worker image here before first analysis."
+  value       = module.batch.ecr_repository_url
+}
+
 # --- Later phases (uncomment as modules land) -------------------------------
 
 # output "app_url" {
