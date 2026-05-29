@@ -10,3 +10,5 @@ terraform.tfvars
 backend.tf
 override.tf
 override.tf.json
+tfplan
+*.tfplan
