@@ -49,6 +49,20 @@ variable "redis_node_type" {
   default     = "cache.t4g.micro"
 }
 
+# --- Serving layer (backend / frontend / auth modules, Phase 3) -------------
+
+variable "alb_certificate_arn" {
+  description = "ACM cert ARN to enable an HTTPS listener on the ALB (needed for ALB-level Cognito auth). Empty = HTTP only (fine behind CloudFront, which terminates TLS at the edge)."
+  type        = string
+  default     = ""
+}
+
+variable "cognito_domain_suffix" {
+  description = "Suffix for the Cognito hosted-UI domain; the full prefix must be globally unique."
+  type        = string
+  default     = "auth"
+}
+
 # --- Application sizing / behavior knobs ------------------------------------
 
 variable "max_upload_size_mb" {

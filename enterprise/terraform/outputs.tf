@@ -47,7 +47,29 @@ output "ghidra_ecr_repository_url" {
   value       = module.batch.ecr_repository_url
 }
 
-# --- Later phases (uncomment as modules land) -------------------------------
+# --- Phase 3: serving layer -------------------------------------------------
+output "app_url" {
+  description = "CloudFront URL serving the Wairz SPA + API."
+  value       = "https://${module.frontend.cloudfront_domain}"
+}
+
+output "alb_dns_name" {
+  description = "Backend ALB DNS name (CloudFront API origin)."
+  value       = module.backend.alb_dns_name
+}
+
+output "backend_ecr_repository_url" {
+  description = "Push the backend image here (also reused as the Batch Ghidra image)."
+  value       = module.backend.ecr_repository_url
+}
+
+output "cognito_user_pool_id" {
+  value = module.auth.user_pool_id
+}
+
+output "cognito_hosted_ui_domain" {
+  value = module.auth.hosted_ui_domain
+}
 
 # output "app_url" {
 #   description = "CloudFront URL serving the Wairz SPA."

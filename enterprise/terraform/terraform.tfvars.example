@@ -16,6 +16,21 @@ tags = {
   # Owner = "security-team"
 }
 
+# --- Network ----------------------------------------------------------------
+vpc_cidr = "10.42.0.0/16"
+# false = private egress via VPC endpoints (cheaper at rest); true = NAT gateway.
+create_nat_gateway = false
+
+# --- Cache ------------------------------------------------------------------
+redis_node_type = "cache.t4g.micro"
+
+# --- Serving layer (backend / frontend / auth) ------------------------------
+# ACM cert ARN to add an HTTPS listener on the ALB (needed for ALB-level Cognito
+# auth). Empty = HTTP only; fine because CloudFront terminates TLS at the edge.
+alb_certificate_arn = ""
+# Cognito hosted-UI domain suffix; the full prefix must be globally unique.
+cognito_domain_suffix = "auth"
+
 # --- Application ------------------------------------------------------------
 # Max firmware upload size (MB). Plumbs to backend + ALB + CloudFront limits.
 max_upload_size_mb = 500

@@ -1,5 +1,6 @@
 from app.ai.tool_registry import ToolRegistry
 from app.ai.tools.binary import register_binary_tools
+from app.config import get_settings
 from app.ai.tools.carving import register_carving_tools
 from app.ai.tools.comparison import register_comparison_tools
 from app.ai.tools.documents import register_document_tools
@@ -26,10 +27,16 @@ def create_tool_registry() -> ToolRegistry:
     register_report_writer_tools(registry)
     register_document_tools(registry)
     register_sbom_tools(registry)
-    register_emulation_tools(registry)
-    register_fuzzing_tools(registry)
     register_comparison_tools(registry)
-    register_uart_tools(registry)
-    register_carving_tools(registry)
     register_rtos_tools(registry)
+
+    # C6: features that require the host Docker socket (emulation, fuzzing,
+    # carving) or host hardware (the UART serial bridge) aren't available in the
+    # cloud deployment — they run in a local Wairz install. Register them only
+    # in local mode so the cloud profile doesn't expose tools that can't work.
+    if get_settings().compute_backend == "local":
+        register_emulation_tools(registry)
+        register_fuzzing_tools(registry)
+        register_carving_tools(registry)
+        register_uart_tools(registry)
     return registry

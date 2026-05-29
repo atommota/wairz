@@ -87,24 +87,44 @@ module "batch" {
   secret_arns                         = [module.database.database_url_secret_arn]
 }
 
-# module "backend" {
-#   source             = "./modules/backend"
-#   name               = local.name
-#   database_url_secret = module.database.db_secret_arn
-#   redis_endpoint     = module.cache.redis_endpoint
-#   efs_id             = module.storage.efs_id
-#   batch_job_queue    = module.batch.job_queue_arn
-#   batch_job_definition = module.batch.job_definition_arn
-#   max_upload_size_mb = var.max_upload_size_mb
-# }
+module "backend" {
+  source     = "./modules/backend"
+  name       = local.name
+  aws_region = var.aws_region
+  vpc_id     = module.network.vpc_id
 
-# module "frontend" {
-#   source         = "./modules/frontend"
-#   name           = local.name
-#   alb_dns_name   = module.backend.alb_dns_name
-# }
+  public_subnet_ids  = module.network.public_subnet_ids
+  private_subnet_ids = module.network.private_subnet_ids
 
-# module "auth" {
-#   source = "./modules/auth"
-#   name   = local.name
-# }
+  efs_id                              = module.storage.efs_id
+  efs_firmware_access_point_id        = module.storage.efs_firmware_access_point_id
+  efs_ghidra_projects_access_point_id = module.storage.efs_ghidra_projects_access_point_id
+  redis_url                           = module.cache.redis_url
+  database_url_secret_arn             = module.database.database_url_secret_arn
+  secret_arns                         = [module.database.database_url_secret_arn]
+
+  batch_job_queue           = module.batch.job_queue_arn
+  batch_job_definition_arn  = module.batch.import_job_definition_arn
+  batch_job_definition_name = module.batch.import_job_definition_name
+
+  max_upload_size_mb = var.max_upload_size_mb
+  certificate_arn    = var.alb_certificate_arn
+}
+
+module "frontend" {
+  source = "./modules/frontend"
+  name   = local.name
+
+  spa_bucket                      = module.storage.spa_bucket
+  spa_bucket_arn                  = module.storage.spa_bucket_arn
+  spa_bucket_regional_domain_name = module.storage.spa_bucket_regional_domain_name
+  alb_dns_name                    = module.backend.alb_dns_name
+}
+
+module "auth" {
+  source        = "./modules/auth"
+  name          = local.name
+  domain_suffix = var.cognito_domain_suffix
+  callback_urls = ["https://${module.frontend.cloudfront_domain}/oauth2/idpresponse"]
+  logout_urls   = ["https://${module.frontend.cloudfront_domain}/"]
+}

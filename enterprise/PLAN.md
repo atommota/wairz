@@ -374,10 +374,29 @@ timer; empty-queue idle past `ttl` → exits. **DoD(2c):** cold reuse works via
 one-shot job; after `warm_analysis_worker`, repeated decompiles return in
 seconds (no per-call cold start) and the worker self-terminates after idle.
 
-### Phase 3 — Serving layer (backend, frontend, auth)
+### Phase 3 — Serving layer (backend, frontend, auth) — ✅ code DONE, apply pending
 - Implement `backend` (ECR + Fargate + ALB + autoscaling), `frontend` (S3 +
   CloudFront), `auth` (Cognito) modules.
 - App-code **C6** (gate `docker.sock` features off in cloud profile).
+- **Implemented + validated:** `modules/backend` (ECR, ECS cluster, Fargate task
+  with EFS mounts + DATABASE_URL secret + COMPUTE_BACKEND/BATCH_* env, ALB +
+  target group + HTTP listener (+ optional HTTPS when `alb_certificate_arn`
+  set), CPU autoscaling, IAM exec + task role with `batch:SubmitJob/DescribeJobs`),
+  `modules/frontend` (CloudFront: S3/OAC origin for the SPA + ALB origin for
+  `/api/*` with AllViewer/CachingDisabled for websockets, SPA 403/404→index.html
+  fallback, OAC bucket policy), `modules/auth` (Cognito user pool + app client +
+  hosted-UI domain, invite-only). Root wires all three; `terraform validate` +
+  `fmt` clean. C6: `create_tool_registry` registers emulation/fuzzing/carving/
+  uart only when `compute_backend == "local"`.
+- **Verified here:** C6 gating — local exposes 100 tools (incl. emulation/fuzzing/
+  uart), aws_batch exposes 67 (33 host-only tools hidden); suite 216 passed.
+- **Frontend routing:** chose **option A** (CloudFront multi-origin) per §6.
+- **Apply pending an AWS account.** Also note image build/push to ECR + SPA sync
+  to S3 + CloudFront invalidation are operator/CI steps (a `null_resource`/CI
+  hook can automate; see Phase 4).
+- **Auth wiring note:** the Cognito pool is created; enforcing it at the ALB
+  (authenticate-cognito action) needs the HTTPS listener (`alb_certificate_arn`)
+  — documented, not auto-enabled, so the stack deploys without a domain/cert.
 - **Frontend routing decision (pick and document):**
   - **(A) CloudFront multi-origin (recommended):** S3 origin for static assets,
     ALB origin for `/api/*` + websockets. Translate `nginx.conf.template`

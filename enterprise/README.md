@@ -8,9 +8,13 @@ scale-to-zero workers via **AWS Batch**.
 It is a self-contained deployment target. Clone the repo, `cd enterprise`,
 set your variables, and apply the Terraform.
 
-> **Status:** scaffolding + build plan. The Terraform modules are stubs being
-> filled in per [`PLAN.md`](./PLAN.md). Not yet deployable. See the plan for
-> the current phase and what works.
+> **Status:** all Terraform modules (network, storage, database, cache, batch,
+> backend, frontend, auth) are authored and pass `terraform validate`; the
+> backend app-code paths (Batch dispatch, Redis lock, cloud tool-gating) are
+> implemented and the local path is verified unchanged. **Not yet apply-tested**
+> against a live AWS account, and image build/push + SPA sync are not yet
+> automated (Phase 4). See [`PLAN.md`](./PLAN.md) for per-phase status and the
+> remaining operator/CI steps.
 
 ## Why this exists
 
