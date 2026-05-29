@@ -1,0 +1,12 @@
+# Local Terraform state & caches
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+# Operator-supplied values (may contain secret references)
+terraform.tfvars
+*.auto.tfvars
+backend.tf
+override.tf
+override.tf.json
