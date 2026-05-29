@@ -33,6 +33,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         kernels: ./emulation/kernels
+        ghidra_scripts: ./ghidra/scripts
       args:
         DOCKER_GID: "${DOCKER_GID:-999}"
     ports:

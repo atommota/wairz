@@ -396,13 +396,28 @@ import.
   works (job runs, writes cache); only intermediate polling may misreport. Low
   risk (re-submit is idempotent). Tracked for 2c.
 
-**2c — Reuse dispatch + warm worker (C8).** Reuse runs default to one-shot
-`-process -readOnly` Batch jobs against the EFS project. Add
-`warm_analysis_worker(ttl_minutes)` (explicit opt-in): a long-lived Batch job
-(on-demand, not Spot) draining a Redis work-queue; reuse calls reset its idle
-timer; empty-queue idle past `ttl` → exits. **DoD(2c):** cold reuse works via
-one-shot job; after `warm_analysis_worker`, repeated decompiles return in
-seconds (no per-call cold start) and the worker self-terminates after idle.
+**2c — Reuse dispatch + warm worker (C8). ✅ DONE, validated on AWS.** In cloud
+mode `run_ghidra_subprocess` delegates query scripts to a warm reuse worker over
+Redis instead of running Ghidra in the backend; `ensure_analysis` auto-dispatches
+the heavy import to Batch (never runs Ghidra in-backend). `warm_analysis_worker`
+(explicit opt-in) pre-starts a long-lived Batch worker that drains a Redis queue;
+activity resets its idle timer; empty-queue idle past `ttl` → exits.
+- **Implemented:** `app/workers/run_reuse_worker.py`; `_run_ghidra_local` /
+  `_run_ghidra_remote` / `ensure_reuse_worker` in `ghidra_service`;
+  `BatchDispatcher.dispatch_reuse_worker`; `warm_analysis_worker` MCP tool;
+  C5 fn-status Batch mapping. Reuse worker runs on the existing Batch queue via
+  a command override (no new infra). Local mode byte-identical.
+- **Validated on AWS (2026-05-29):** a driver exercised the full data path —
+  Redis queue (ElastiCache) → `_run_ghidra_local` import+persist on a Batch
+  instance (EFS) → result round-trip → `-process` reuse (22.5s import → 10.2s
+  reuse), EFS project persisted; the C3 Redis lock ran against ElastiCache. The
+  `run_reuse_worker` lifecycle was confirmed: boot → blocking drain → idle
+  self-exit (exit 0).
+- **Two bugs fixed during 2c live test:** (a) the Ghidra **scripts** weren't in
+  the image (`/opt/ghidra_scripts` empty in cloud → every `-postScript` failed)
+  → baked in via a `ghidra_scripts` build context; (b) redis-py's blocking
+  `BLPOP` read-times-out on an empty queue unless `socket_timeout` exceeds the
+  BLPOP timeout → set explicitly in the worker and `_run_ghidra_remote`.
 
 ### Phase 3 — Serving layer (backend, frontend, auth) — ✅ code DONE, apply pending
 - Implement `backend` (ECR + Fargate + ALB + autoscaling), `frontend` (S3 +

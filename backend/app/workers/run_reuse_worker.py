@@ -41,7 +41,13 @@ _HB_TTL = 30
 async def _run(idle_ttl: int) -> int:
     import redis.asyncio as aioredis
 
-    client = aioredis.from_url(get_settings().redis_url)
+    # socket_timeout must exceed the BLPOP server-side timeout, or the client's
+    # read times out while the (empty-queue) BLPOP is still legitimately blocking.
+    client = aioredis.from_url(
+        get_settings().redis_url,
+        socket_timeout=_POP_TIMEOUT + 15,
+        socket_keepalive=True,
+    )
     logger.info("Reuse worker up (idle_ttl=%ds)", idle_ttl)
     last_work = time.time()
     try:

@@ -123,9 +123,15 @@ COPY . .
 # on top at runtime, allowing users to add custom kernels.
 COPY --from=kernels . /opt/kernels/
 
+# Bake in the Ghidra headless scripts (AnalyzeBinary.java, DecompileFunction.java,
+# ...). Locally these come via the compose bind mount (./ghidra/scripts:
+# /opt/ghidra_scripts), but the cloud (Batch/Fargate) deployment has no bind
+# mount — without baking them in, every analyzeHeadless -postScript fails.
+COPY --from=ghidra_scripts . /opt/ghidra_scripts/
+
 # Create data and Ghidra project directories
 RUN mkdir -p /data/firmware /tmp/ghidra_projects \
-    && chown -R wairz:wairz /data /app /tmp/ghidra_projects /opt/ghidra /opt/kernels
+    && chown -R wairz:wairz /data /app /tmp/ghidra_projects /opt/ghidra /opt/kernels /opt/ghidra_scripts
 
 USER wairz
 

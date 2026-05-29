@@ -638,7 +638,15 @@ async def _run_ghidra_remote(
     import redis.asyncio as aioredis
 
     settings = get_settings()
-    client = aioredis.from_url(settings.redis_url)
+    # The result BLPOP blocks for up to (timeout + grace); the client socket
+    # read timeout must exceed that, or it fires mid-wait (redis-py doesn't
+    # auto-extend it for blocking commands).
+    wait = int(effective_timeout) + _REUSE_DISPATCH_GRACE
+    client = aioredis.from_url(
+        settings.redis_url,
+        socket_timeout=wait + 30,
+        socket_keepalive=True,
+    )
     req_id = uuid.uuid4().hex
     result_key = f"{_REUSE_RESULT_PREFIX}{req_id}"
     payload = json.dumps({
@@ -654,8 +662,8 @@ async def _run_ghidra_remote(
         await ensure_reuse_worker(
             client, settings.re_worker_idle_ttl_minutes * 60,
         )
-        # BLPOP blocks efficiently until the worker pushes the result.
-        wait = int(effective_timeout) + _REUSE_DISPATCH_GRACE
+        # BLPOP blocks efficiently until the worker pushes the result (socket
+        # timeout set above to outlast `wait`).
         popped = await client.blpop([result_key], timeout=wait)
         if popped is None:
             raise TimeoutError(
