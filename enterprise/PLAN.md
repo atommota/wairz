@@ -128,36 +128,83 @@ discriminator setting, e.g. `compute_backend: Literal["local", "aws_batch"] =
 | # | Change | File(s) | Notes |
 |---|--------|---------|-------|
 | C1 | Add `compute_backend` + AWS settings (`aws_region`, `batch_job_queue`, `batch_job_definition`, `s3_*` if needed) | `app/config.py` | Defaults keep `local` behavior |
-| C2 | Abstract Ghidra dispatch behind a strategy: `local` spawns the existing detached worker; `aws_batch` calls `batch:SubmitJob` | `app/services/ghidra_service.py` (dispatch site of `run_ghidra_analysis`) | The Batch job runs the **same** `python -m app.workers.run_ghidra_analysis ...` command in the backend/ghidra image |
-| C3 | Move `_cross_process_analysis_lock` to a Redis-backed lock when `compute_backend != "local"` | `app/services/ghidra_service.py` | Use the existing `redis_url`; a simple `SET NX PX` lease + renewal is enough |
+| C2 | Abstract Ghidra dispatch behind a strategy: `local` spawns the existing detached worker; `aws_batch` calls `batch:SubmitJob`. **Done (Phase 0):** seam lives in `app/services/compute_dispatch.py`; `local` path unchanged | `app/ai/tools/binary.py`, `app/services/compute_dispatch.py` | The Batch job runs the **same** `python -m app.workers.run_ghidra_analysis ...` command |
+| C3 | Move `_cross_process_analysis_lock` to a Redis-backed lock when `compute_backend != "local"` | `app/services/ghidra_service.py` | Use the existing `redis_url`; `SET NX PX` lease + renewal. Guards the **import/write** (§3.1) |
 | C4 | Ensure `STORAGE_ROOT` works on EFS (no behavior change expected; verify no host-path assumptions) | `app/utils/sandbox.py`, storage paths | Mostly a verification task |
-| C5 | Status mapping: `check_binary_analysis_status` should also reflect Batch job states (e.g. `SUBMITTED/RUNNABLE/STARTING` → "queued/starting") so a cold-start (1–3 min) reads correctly in the UI | `ghidra_service.py`, status tool | Optional polish; cache row remains source of truth on completion |
+| C5 | Status mapping: `check_binary_analysis_status` should also reflect Batch job states (e.g. `SUBMITTED/RUNNABLE/STARTING` → "queued/starting") so a cold-start (1–3 min) reads correctly in the UI | `ghidra_service.py`, status tool | Cache row remains source of truth on completion |
 | C6 | Feature-flag the `docker.sock` features off in the cloud profile with a clear "run locally" message | `tools/{carving,fuzzing,emulation}.py` registration / capability gate | Avoids confusing errors on Fargate |
+| **C7** | **Persistent Ghidra project store** — import once, reuse forever (§3.1). The single biggest Phase 2 change; **also benefits local mode** | `app/services/ghidra_service.py` (`_build_analyze_command`, `run_ghidra_subprocess`, `ensure_analysis`) | Replaces import-and-`-deleteProject`-every-call with `-import` once + `-process -readOnly` reuse |
+| **C8** | **Warm RE worker** (explicit opt-in) — session-scoped hot compute for reuse runs (§3.2) | new `app/services/re_worker_service.py`, new MCP tool `warm_analysis_worker`, `tools/binary.py` reuse-dispatch | Long-lived Batch job draining a Redis queue; idle-timeout to zero |
 
 **Acceptance for the app-code layer:** with `compute_backend=local`, behavior is
-byte-for-byte the current behavior (run the existing test suite). With
-`compute_backend=aws_batch` + env pointing at a Batch queue + EFS, a
-`start_binary_analysis` submits a Batch job, the job runs the worker, writes the
-cache row, and `check_binary_analysis_status` transitions to complete.
+byte-for-byte the current behavior except reuse is **faster** (C7 removes
+per-call re-analysis) — run the existing test suite. With
+`compute_backend=aws_batch` + EFS + Batch, the flows in §3.1/§3.2 hold.
 
-> **Phase 2 finding (recorded during Phase 0 — do not miss this).** C2 as
-> scoped only covers the **detached-worker** dispatch (`start_binary_analysis`
-> / `start_function_decompile`, now routed through
-> `app/services/compute_dispatch.py`). There is a **second, synchronous Ghidra
-> path**: `run_ghidra_subprocess` in `ghidra_service.py`, called *inline*
-> (MCP-bounded, `ghidra_timeout`) by `decompile_function`, `find_string_refs`,
-> `get_stack_layout`, `get_global_layout`, and similar tools in `binary.py`.
-> Those run Ghidra **in the backend process** and would (a) defeat the point of
-> moving heavy compute off the backend and (b) hard-fail on a slim backend
-> image that ships without Ghidra. Phase 2 must decide one of:
-> 1. **Keep Ghidra in the backend image** for the synchronous fallback (simplest;
->    skip the slim-image optimization).
-> 2. **Cache-only in cloud mode:** synchronous tools return "run
->    `start_binary_analysis` first" instead of analyzing inline when
->    `compute_backend != "local"` (forces the async/Batch path; cleanest split).
-> 3. Route synchronous calls to Batch too (hard — they're interactive/bounded).
-> Recommended default: **option 1** for the MVP, revisit option 2 with the
-> slim-image work in Phase 4.
+### 3.1 Persistent Ghidra project store (C7) — the core of Phase 2
+
+**Problem found in Phase 0:** `_build_analyze_command` always uses
+`-import <binary> … -postScript … -deleteProject`, so **every** synchronous
+Ghidra call (the 5 query scripts: `DecompileFunction`, `FindStringRefs`,
+`StackLayout`, `GlobalLayout`, `TaintAnalysis` — plus `ensure_analysis` for the
+Class-A read tools) re-imports and re-runs the heavy auto-analysis in a
+throwaway project. There is **no Ghidra-level curation write-back today** — the
+5 query scripts are read-only emitters; only `AnalyzeBinary.java` writes. So the
+reusable asset is the **analyzed program** itself.
+
+**Design — one persistent project per binary, keyed by `sha256`:**
+
+- **Store location:** EFS in cloud (`GHIDRA_PROJECT_ROOT`, mounted by backend +
+  all Batch jobs); a new `ghidra_projects` Docker volume locally. Path includes
+  the Ghidra version: `<root>/<ghidra_ver>/<sha256>/` (so a Ghidra upgrade never
+  opens an incompatible project).
+- **Import once (write, heavy):** first touch runs `-import … -postScript
+  AnalyzeBinary.java` and **keeps** the project (drop `-deleteProject`). Guarded
+  by the **Redis lock (C3)** keyed by sha256 so concurrent first-touches dedupe.
+  In cloud this is a **Batch** job; locally it's the detached worker / inline.
+- **Reuse forever (read, light):** all 5 query scripts run
+  `analyzeHeadless <project> <sha256> -process -readOnly -postScript <script>` —
+  no re-import, no re-analysis (minutes → seconds). `-readOnly` takes no project
+  write-lock, so **unlimited concurrent reuse across users/agents is safe.**
+- **Program naming:** import so the program is addressable by `sha256` for
+  `-process` (import a path/symlink named `<sha256>`, or store the basename↔sha
+  mapping). Implementation detail — make it deterministic.
+- **Cross-firmware dedup (bonus):** content-hash key ⇒ a binary shipped in many
+  firmwares (e.g. busybox) is analyzed once, reused everywhere.
+- **GC:** projects accumulate on disk → LRU/size-cap eviction by last-access;
+  `log()` evictions (never silent).
+- **Future upgrade path (NOT now):** persisting *interactive curation*
+  (renames/comments/types shared across users) would need a **Ghidra Server**
+  (multi-writer check-in/out). Out of scope until Wairz writes curation back;
+  the file-project store is forward-compatible with that move.
+
+### 3.2 Warm RE worker (C8) — interactive reuse without a big always-on box
+
+Reuse runs are **frequent and interactive** (agent answering questions about a
+binary). Heavy initial analysis always goes to **scale-to-zero Batch**. Reuse
+runs execute as follows:
+
+- **Default (rest = $0):** each reuse run is a **one-shot Batch job** (`-process
+  -readOnly` against the EFS project). Works; ~1–3 min cold start per call.
+- **Warm mode (explicit opt-in):** a tool `warm_analysis_worker(ttl_minutes=N)`
+  starts a **long-lived Batch job** that drains a **Redis work-queue**: backend
+  pushes `{sha256, script, args}`, the worker pops, runs `-process -readOnly`,
+  writes the result to a Redis key, backend polls it (sub-second). Each reuse
+  call **resets the idle timer**; after `ttl` minutes idle (empty queue) the
+  worker exits → back to zero. So it stays hot during an active RE session and
+  tears down afterward. Pay the cold start **once per session**, not per call.
+- **Spot policy:** warm worker runs **on-demand** (no mid-session death); heavy
+  initial-analysis jobs stay on **Spot** (idempotent).
+- **Same mechanism** as the future emulation on-demand worker (§8) — build once.
+
+Because no inline Ghidra runs on the backend, the **slim backend image becomes
+achievable** (drop Ghidra + JDK; keep the unpack toolchain). Promoted from
+"optional" to a real Phase 2/4 outcome.
+
+> **Retracted:** the earlier "keep Ghidra in the backend and run inline" option
+> is rejected — it would require a ~16 GB always-on Fargate task doing heavy
+> analysis on the request path, reintroducing the oversized always-on instance
+> this whole effort exists to eliminate.
 
 ---
 
@@ -208,9 +255,12 @@ wires them into the ECS task definition and the Batch job definition.
 | `DATABASE_URL` (`database_url`) | `database` module → secret | asyncpg URL to Aurora |
 | `REDIS_URL` (`redis_url`) | `cache` module | locks + coordination |
 | `STORAGE_ROOT` (`storage_root`) | fixed `/data/firmware` | EFS mount point in both backend + Batch |
+| `GHIDRA_PROJECT_ROOT` (`ghidra_project_root`) | EFS path (cloud) / `ghidra_projects` volume (local) | persistent project store (C7); mounted by backend + Batch |
 | `COMPUTE_BACKEND` (`compute_backend`) | `aws_batch` in cloud | new setting (C1) |
 | `AWS_REGION` | provider region | |
-| `BATCH_JOB_QUEUE` / `BATCH_JOB_DEFINITION` | `batch` module outputs | C2 |
+| `BATCH_JOB_QUEUE` / `BATCH_JOB_DEFINITION` | `batch` module outputs | C2 (heavy import) |
+| `BATCH_REUSE_JOB_DEFINITION` (`batch_reuse_job_definition`) | `batch` module output | C8 warm/one-shot reuse worker (`-process -readOnly`) |
+| `RE_WORKER_IDLE_TTL_MINUTES` (`re_worker_idle_ttl_minutes`) | tfvar, default 20 | warm worker idle teardown (C8) |
 | `NVD_API_KEY` (`nvd_api_key`) | Secrets Manager | optional |
 | `MAX_UPLOAD_SIZE_MB` (`max_upload_size_mb`) | tfvar | also sets ALB/CloudFront body limits + nginx |
 | `LOG_LEVEL` (`log_level`) | tfvar | |
@@ -247,16 +297,34 @@ a phase complete without meeting it.
 - **DoD:** `terraform apply` stands up VPC + EFS + Aurora + Redis; a throwaway
   EC2/ECS task can mount the EFS access point and connect to Aurora + Redis.
 
-### Phase 2 — Ghidra on Batch
-- Implement `batch` module (compute env `minvCpus=0`, Spot; job queue; job
-  definition mounting EFS, running the Ghidra worker command).
-- Build the Batch Ghidra image in `enterprise/docker/` (reuse `ghidra/` or the
-  backend image; entrypoint = `python -m app.workers.run_ghidra_analysis`).
-- Complete app-code **C2** (real `SubmitJob`) and **C5** (status mapping).
-- **DoD:** with `compute_backend=aws_batch`, `start_binary_analysis` submits a
-  job, Batch scales 0→1, the job decompiles a test binary, writes the cache row,
-  scales back to 0, and `check_binary_analysis_status` reports complete. Verify
-  Spot interruption mid-job → re-run completes (idempotency, fact #6).
+### Phase 2 — Ghidra on Batch + persistent project store + warm worker
+This is the heaviest phase. Sub-steps, in order:
+
+**2a — Persistent project store (C7), local-first.** Land `-import`-once +
+`-process -readOnly`-reuse against a per-`sha256` project store, behind a
+`ghidra_projects` volume, in **local mode**. This is a pure speed win locally
+and de-risks the cloud work. Includes program-naming, version-keyed paths, and
+LRU GC. **DoD(2a):** local suite green; a second `decompile_function` /
+`find_string_refs` on the same binary runs with no re-analysis (verify via logs
+/ timing); concurrent `-readOnly` reuse of one binary works.
+
+**2b — Batch module + heavy import on Batch (C2 real `SubmitJob`, C3, C5).**
+`batch` module (compute env `minvCpus=0`, Spot, `maxvCpus` ceiling; job queue;
+import job definition mounting EFS at `STORAGE_ROOT` + `GHIDRA_PROJECT_ROOT`).
+Build the Batch Ghidra image in `enterprise/docker/` (entrypoint runs the import
+worker). Redis-backed lock (C3) guards the import. **DoD(2b):** with
+`compute_backend=aws_batch`, `start_binary_analysis` submits a job, Batch scales
+0→1, imports + analyzes a test binary, persists the project to EFS, writes the
+cache row, scales to 0; `check_binary_analysis_status` reports complete; Spot
+interruption mid-import → re-run completes (idempotent).
+
+**2c — Reuse dispatch + warm worker (C8).** Reuse runs default to one-shot
+`-process -readOnly` Batch jobs against the EFS project. Add
+`warm_analysis_worker(ttl_minutes)` (explicit opt-in): a long-lived Batch job
+(on-demand, not Spot) draining a Redis work-queue; reuse calls reset its idle
+timer; empty-queue idle past `ttl` → exits. **DoD(2c):** cold reuse works via
+one-shot job; after `warm_analysis_worker`, repeated decompiles return in
+seconds (no per-call cold start) and the worker self-terminates after idle.
 
 ### Phase 3 — Serving layer (backend, frontend, auth)
 - Implement `backend` (ECR + Fargate + ALB + autoscaling), `frontend` (S3 +
