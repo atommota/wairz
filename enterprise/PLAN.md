@@ -140,6 +140,25 @@ byte-for-byte the current behavior (run the existing test suite). With
 `start_binary_analysis` submits a Batch job, the job runs the worker, writes the
 cache row, and `check_binary_analysis_status` transitions to complete.
 
+> **Phase 2 finding (recorded during Phase 0 — do not miss this).** C2 as
+> scoped only covers the **detached-worker** dispatch (`start_binary_analysis`
+> / `start_function_decompile`, now routed through
+> `app/services/compute_dispatch.py`). There is a **second, synchronous Ghidra
+> path**: `run_ghidra_subprocess` in `ghidra_service.py`, called *inline*
+> (MCP-bounded, `ghidra_timeout`) by `decompile_function`, `find_string_refs`,
+> `get_stack_layout`, `get_global_layout`, and similar tools in `binary.py`.
+> Those run Ghidra **in the backend process** and would (a) defeat the point of
+> moving heavy compute off the backend and (b) hard-fail on a slim backend
+> image that ships without Ghidra. Phase 2 must decide one of:
+> 1. **Keep Ghidra in the backend image** for the synchronous fallback (simplest;
+>    skip the slim-image optimization).
+> 2. **Cache-only in cloud mode:** synchronous tools return "run
+>    `start_binary_analysis` first" instead of analyzing inline when
+>    `compute_backend != "local"` (forces the async/Batch path; cleanest split).
+> 3. Route synchronous calls to Batch too (hard — they're interactive/bounded).
+> Recommended default: **option 1** for the MVP, revisit option 2 with the
+> slim-image work in Phase 4.
+
 ---
 
 ## 4. Terraform layout & conventions
@@ -206,13 +225,20 @@ Each phase is independently shippable; the app keeps working throughout. Do them
 in order. **Definition of done** is listed per phase — an agent should not mark
 a phase complete without meeting it.
 
-### Phase 0 — Foundations (no AWS yet)
+### Phase 0 — Foundations (no AWS yet) — ✅ DONE
 - Write `terraform/versions.tf`, root `main.tf`/`variables.tf`/`outputs.tf`
   skeleton, `terraform.tfvars.example`, `backend.tf.example`.
 - Implement app-code changes **C1** (settings) and the strategy *seam* for **C2**
   (no Batch call yet — just the indirection, `local` path unchanged).
 - **DoD:** `terraform validate` passes on the skeleton; local `docker-compose`
   still works; existing backend tests green with `compute_backend=local`.
+- **Outcome:** `terraform validate` + `fmt` clean. Backend suite run inside the
+  container with the edited files overlaid: **216 passed, 12 skipped**, no new
+  failures vs. baseline. (3 pre-existing failures in
+  `test_mcp_firmware_selection.py` are unrelated — a stale `_FakeFirmware`
+  fixture missing `firmware_kind`; they fail on the baked image too.) C2 seam:
+  `app/services/compute_dispatch.py` (`get_dispatcher()` → `LocalDispatcher`
+  by default), wired into `binary.py`.
 
 ### Phase 1 — State backbone (network, storage, db, cache)
 - Implement `network`, `storage` (EFS + S3), `database` (Aurora SLv2), `cache`

@@ -6,8 +6,6 @@ import json
 import logging
 import os
 import re
-import subprocess
-import sys
 import time
 
 from elftools.elf.elffile import ELFFile
@@ -15,6 +13,7 @@ from elftools.elf.sections import SymbolTableSection
 
 from app.ai.tool_registry import ToolContext, ToolRegistry
 from app.services.analysis_service import check_binary_protections
+from app.services.compute_dispatch import get_dispatcher
 from app.services.ghidra_service import (
     decompile_function,
     get_analysis_cache,
@@ -1396,31 +1395,22 @@ async def _handle_start_binary_analysis(
             f"Poll check_binary_analysis_status."
         )
 
-    # Spawn the detached worker. start_new_session=True makes it survive
-    # the wairz-mcp process dying (e.g. if the MCP client reconnects mid-
-    # analysis). stdio is detached so the parent doesn't keep pipes open.
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "app.workers.run_ghidra_analysis",
-            "--firmware-id", str(context.firmware_id),
-            "--binary-path", path,
-            "--sha256", sha256,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
+    # Hand off to the configured compute backend. The "local" dispatcher
+    # spawns a detached worker subprocess on this host; other backends (e.g.
+    # aws_batch) submit the same worker as a remote job. Either way the worker
+    # writes its result to the cache rows the status tool polls.
+    handle = get_dispatcher().dispatch_analysis(
+        context.firmware_id, path, sha256,
     )
 
     await cache.mark_run_started(
-        context.firmware_id, path, sha256, proc.pid, context.db,
+        context.firmware_id, path, sha256, handle.pid, context.db,
     )
     await context.db.commit()
 
     return (
         f"started - Ghidra analysis kicked off for {os.path.basename(path)} "
-        f"(pid={proc.pid}, sha256={sha256[:12]}). Poll "
+        f"(pid={handle.pid}, sha256={sha256[:12]}). Poll "
         f"check_binary_analysis_status until status=complete; multi-MB "
         f"binaries typically take 5-30 minutes on cold cache. The worker "
         f"runs independently of this MCP session, so the analysis "
@@ -1514,29 +1504,19 @@ async def _handle_start_function_decompile(
             f"Poll check_function_decompile_status."
         )
 
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "app.workers.run_function_decompile",
-            "--firmware-id", str(context.firmware_id),
-            "--binary-path", path,
-            "--sha256", sha256,
-            "--function-name", function_name,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
+    handle = get_dispatcher().dispatch_decompile(
+        context.firmware_id, path, sha256, function_name,
     )
 
     await cache.mark_function_run_started(
-        context.firmware_id, path, sha256, function_name, proc.pid, context.db,
+        context.firmware_id, path, sha256, function_name, handle.pid,
+        context.db,
     )
     await context.db.commit()
 
     return (
         f"started - decompile kicked off for '{function_name}' in "
-        f"{os.path.basename(path)} (pid={proc.pid}). Poll "
+        f"{os.path.basename(path)} (pid={handle.pid}). Poll "
         f"check_function_decompile_status until complete. Large handler "
         f"functions in firmware daemons typically take 1-15 min. The "
         f"worker has a 30-minute budget; if it fails with a timeout, "

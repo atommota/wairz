@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -46,6 +47,16 @@ class Settings(BaseSettings):
     uart_bridge_port: int = 9999
     uart_command_timeout: int = 30
     log_level: str = "INFO"
+
+    # --- Compute backend (enterprise cloud deploy) ---------------------------
+    # Where heavy Ghidra jobs run. "local" (default) spawns detached worker
+    # subprocesses on the backend host — the standard docker-compose behavior,
+    # unchanged. "aws_batch" submits the same worker as an AWS Batch job
+    # (enterprise/PLAN.md, Phase 2). Defaults keep the local deploy identical.
+    compute_backend: Literal["local", "aws_batch"] = "local"
+    aws_region: str = ""
+    batch_job_queue: str = ""
+    batch_job_definition: str = ""
 
 
 @lru_cache
