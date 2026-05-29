@@ -168,6 +168,14 @@ resource "aws_ecs_task_definition" "this" {
     essential    = true
     portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
 
+    # Run from the image's prebuilt venv directly. The image's default CMD uses
+    # `uv run`, which re-resolves the project against pypi.org at startup — that
+    # fails in a private subnet with no internet egress (VPC endpoints reach AWS
+    # services only). Invoking the venv binaries avoids any network at boot.
+    command = ["sh", "-c",
+      "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${var.container_port}"
+    ]
+
     environment = [
       { name = "COMPUTE_BACKEND", value = "aws_batch" },
       { name = "AWS_REGION", value = var.aws_region },
@@ -177,6 +185,11 @@ resource "aws_ecs_task_definition" "this" {
       { name = "BATCH_JOB_QUEUE", value = var.batch_job_queue },
       { name = "BATCH_JOB_DEFINITION", value = var.batch_job_definition_name },
       { name = "MAX_UPLOAD_SIZE_MB", value = tostring(var.max_upload_size_mb) },
+      # Host/origin guard: behind CloudFront/ALB (+ Cognito) the Host varies, so
+      # default to permissive. Tighten to the specific CloudFront/custom domain
+      # in production if you want DNS-rebinding protection at the app layer too.
+      { name = "ALLOWED_HOSTS", value = var.allowed_hosts },
+      { name = "ALLOWED_ORIGINS", value = var.allowed_origins },
     ]
     secrets = [
       { name = "DATABASE_URL", valueFrom = var.database_url_secret_arn },
@@ -196,11 +209,12 @@ resource "aws_ecs_task_definition" "this" {
 }
 
 resource "aws_ecs_service" "this" {
-  name            = "${var.name}-backend"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
+  name                              = "${var.name}-backend"
+  cluster                           = aws_ecs_cluster.this.id
+  task_definition                   = aws_ecs_task_definition.this.arn
+  desired_count                     = var.desired_count
+  launch_type                       = "FARGATE"
+  health_check_grace_period_seconds = 120 # let migrations + uvicorn boot before ELB checks count
 
   network_configuration {
     subnets          = var.private_subnet_ids

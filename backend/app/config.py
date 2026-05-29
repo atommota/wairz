@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     uart_command_timeout: int = 30
     log_level: str = "INFO"
 
+    # Host/origin guard (app/main.py). Comma-separated extra entries. Empty =
+    # the built-in localhost set (the local desktop deploy, unchanged). "*"
+    # disables the corresponding check — appropriate when the API sits behind an
+    # authenticating proxy (ALB/CloudFront + Cognito) where Host varies.
+    allowed_hosts: str = ""
+    allowed_origins: str = ""
+
     # --- Compute backend (enterprise cloud deploy) ---------------------------
     # Where heavy Ghidra jobs run. "local" (default) spawns detached worker
     # subprocesses on the backend host — the standard docker-compose behavior,

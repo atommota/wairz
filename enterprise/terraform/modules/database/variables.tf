@@ -31,9 +31,9 @@ variable "max_capacity" {
 }
 
 variable "engine_version" {
-  description = "Aurora PostgreSQL engine version."
+  description = "Aurora PostgreSQL engine version (must be a currently-available Serverless v2 version; check: aws rds describe-db-engine-versions --engine aurora-postgresql)."
   type        = string
-  default     = "16.4"
+  default     = "16.9"
 }
 
 variable "database_name" {

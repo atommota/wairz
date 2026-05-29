@@ -12,6 +12,36 @@ wrong path.
 
 ---
 
+## 0. Live apply-test (2026-05-29) — full stack validated on real AWS
+
+A real `terraform apply` in us-east-1 (account 767303321530) stood up all
+modules and validated the end-to-end paths, then was torn down. **Validated:**
+76→79-resource apply clean; backend Fargate healthy behind the ALB; the API
+served through both the ALB and CloudFront, backed by Aurora (migrations ran,
+`/api/v1/projects`→`[]`); and the **Batch scale-from-zero compute path** — a
+Spot `c6i.xlarge` provisioned, pulled the image from ECR, mounted both EFS
+access points read-write (the shared project store wrote OK), received the
+`DATABASE_URL` secret + env, and had Ghidra + boto3/redis present (job
+SUCCEEDED, exit 0).
+
+**Four real bugs found and fixed (deployment code, not test hacks):**
+1. The image's default CMD uses `uv run`, which re-resolves against pypi.org at
+   startup and times out in a no-egress private subnet → backend module runs the
+   prebuilt venv binaries directly (`/app/.venv/bin/{alembic,uvicorn}`).
+2. The app's `origin_host_guard` hardcoded a localhost-only allowlist → made
+   configurable via `allowed_hosts`/`allowed_origins` settings (empty = original
+   local behavior; `*` for behind-proxy), and `/health` is now guard-exempt so
+   ELB probes pass.
+3. **Missing `ecs`/`ecs-agent`/`ecs-telemetry` VPC interface endpoints** — EC2
+   Batch instances ran the ECS agent but couldn't reach the control plane to
+   register (no NAT), so jobs hung in RUNNABLE. Added to the network module.
+   (Fargate was unaffected — AWS manages its control-plane link.)
+4. Aurora engine `16.4` no longer offered → default bumped to `16.9`.
+
+Also added: ECS service `health_check_grace_period_seconds = 120` (lets
+migrations + uvicorn boot before ELB checks count). All fixes keep the local
+suite green (216 passed) and the local docker-compose deploy unchanged.
+
 ## 1. Architecture (agreed)
 
 ```

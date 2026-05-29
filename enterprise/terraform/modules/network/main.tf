@@ -136,6 +136,13 @@ locals {
     "secretsmanager",
     "logs",
     "sts",
+    # EC2-backed AWS Batch instances run the ECS agent, which must reach the
+    # ECS control plane to register + run tasks. Without these (and with no NAT)
+    # instances launch but never join the cluster, so Batch jobs hang in
+    # RUNNABLE. Fargate doesn't need these (AWS manages its control plane link).
+    "ecs",
+    "ecs-agent",
+    "ecs-telemetry",
   ])
 }
 

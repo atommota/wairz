@@ -9,12 +9,12 @@ It is a self-contained deployment target. Clone the repo, `cd enterprise`,
 set your variables, and apply the Terraform.
 
 > **Status:** all Terraform modules (network, storage, database, cache, batch,
-> backend, frontend, auth) are authored and pass `terraform validate`; the
-> backend app-code paths (Batch dispatch, Redis lock, cloud tool-gating) are
-> implemented and the local path is verified unchanged. **Not yet apply-tested**
-> against a live AWS account, and image build/push + SPA sync are not yet
-> automated (Phase 4). See [`PLAN.md`](./PLAN.md) for per-phase status and the
-> remaining operator/CI steps.
+> backend, frontend, auth) are authored and **apply-tested on a live AWS account
+> (us-east-1, 2026-05-29)** — backend healthy behind ALB + CloudFront and Aurora,
+> and the Batch scale-from-zero Ghidra path verified end-to-end (see PLAN.md §0).
+> The local docker-compose deploy is unchanged (suite green). Still **manual**:
+> image build/push to ECR + SPA sync to S3 + CloudFront invalidation (Phase 4
+> CI hook), and the optional custom domain / ALB-Cognito enforcement.
 
 ## Why this exists
 

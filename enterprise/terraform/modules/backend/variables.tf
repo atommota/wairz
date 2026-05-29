@@ -77,6 +77,18 @@ variable "max_upload_size_mb" {
   description = "Max upload size (plumbs to the app + should match ALB/CloudFront)."
 }
 
+variable "allowed_hosts" {
+  type        = string
+  default     = "*"
+  description = "App Host-guard allowlist (comma-separated; '*' disables). Default permissive since the API is fronted by CloudFront/ALB + Cognito."
+}
+
+variable "allowed_origins" {
+  type        = string
+  default     = "*"
+  description = "App Origin-guard allowlist (comma-separated; '*' disables)."
+}
+
 variable "certificate_arn" {
   type        = string
   default     = ""

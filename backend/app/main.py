@@ -41,6 +41,21 @@ ALLOWED_HOSTS = {
     "127.0.0.1", "127.0.0.1:3000", "127.0.0.1:8000",
 }
 
+# Behind a proxy (ALB/CloudFront) the Host/Origin vary, so allow extending the
+# localhost defaults via settings. "*" disables a check entirely. Empty (the
+# default) preserves the original localhost-only behavior for the local deploy.
+_guard_settings = get_settings()
+
+
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+_HOST_WILDCARD = "*" in _csv(_guard_settings.allowed_hosts)
+_ORIGIN_WILDCARD = "*" in _csv(_guard_settings.allowed_origins)
+ALLOWED_HOSTS |= {h for h in _csv(_guard_settings.allowed_hosts) if h != "*"}
+ALLOWED_ORIGINS.extend(o for o in _csv(_guard_settings.allowed_origins) if o != "*")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -52,12 +67,17 @@ app.add_middleware(
 
 @app.middleware("http")
 async def origin_host_guard(request: Request, call_next):
-    # CSRF + DNS-rebinding guard for the localhost-bound backend.
+    # CSRF + DNS-rebinding guard for the localhost-bound backend. Behind a proxy
+    # the Host/Origin vary; a "*" in allowed_hosts/allowed_origins disables the
+    # respective check. /health is always exempt so load-balancer probes (which
+    # send the target IP as Host) pass regardless of configuration.
+    if request.url.path == "/health":
+        return await call_next(request)
     host = request.headers.get("host", "")
-    if host not in ALLOWED_HOSTS:
+    if not _HOST_WILDCARD and host not in ALLOWED_HOSTS:
         return JSONResponse(status_code=403, content={"detail": "host not allowed"})
     origin = request.headers.get("origin")
-    if origin and origin not in ALLOWED_ORIGINS:
+    if origin and not _ORIGIN_WILDCARD and origin not in ALLOWED_ORIGINS:
         return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
     return await call_next(request)
 
