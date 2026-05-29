@@ -71,8 +71,8 @@ def _release_analysis_flock(fd: int) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _cross_process_analysis_lock(binary_sha256: str):
-    """Host-wide exclusive lock keyed by binary sha256.
+async def _flock_analysis_lock(lock_key: str):
+    """Host-wide exclusive lock via fcntl.flock (local / shared-filesystem).
 
     The class-level asyncio.Event guard only dedupes coroutines within a
     single Python process. Each MCP client connection spawns its own
@@ -84,12 +84,72 @@ async def _cross_process_analysis_lock(binary_sha256: str):
     crashes, so failed analyses don't leave the binary blocked.
     """
     _ANALYSIS_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = str(_ANALYSIS_LOCK_DIR / f"{binary_sha256}.lock")
+    lock_path = str(_ANALYSIS_LOCK_DIR / f"{lock_key}.lock")
     fd = await asyncio.to_thread(_acquire_analysis_flock, lock_path)
     try:
         yield
     finally:
         await asyncio.to_thread(_release_analysis_flock, fd)
+
+
+async def _renew_redis_lock(lock, ttl: int) -> None:
+    """Keep a held Redis lock alive while long work (a Ghidra import) runs."""
+    interval = max(1, ttl // 3)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await lock.extend(ttl, replace_ttl=True)
+        except Exception:
+            # Lost ownership or Redis hiccup — stop renewing; the with-block
+            # will surface failures when it tries to release.
+            return
+
+
+@contextlib.asynccontextmanager
+async def _redis_analysis_lock(lock_key: str):
+    """Distributed exclusive lock via Redis (no shared filesystem for flock).
+
+    Used when compute_backend != "local": the backend and the Batch jobs run on
+    separate hosts, so the flock can't coordinate them. Acquired with a TTL and
+    auto-renewed while held (a cold Ghidra import can take many minutes), so a
+    crashed holder only blocks others for one TTL rather than forever.
+    """
+    import redis.asyncio as aioredis  # lazy: only the cloud path needs redis
+
+    settings = get_settings()
+    ttl = settings.redis_lock_ttl_seconds
+    client = aioredis.from_url(settings.redis_url)
+    lock = client.lock(
+        f"wairz:analysis-lock:{lock_key}", timeout=ttl, blocking=True,
+    )
+    await lock.acquire()
+    renew = asyncio.create_task(_renew_redis_lock(lock, ttl))
+    try:
+        yield
+    finally:
+        renew.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renew
+        with contextlib.suppress(Exception):
+            await lock.release()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+@contextlib.asynccontextmanager
+async def _cross_process_analysis_lock(binary_sha256: str):
+    """Exclusive lock keyed by binary sha256 (or any caller-supplied key).
+
+    Dispatches on the compute backend: fcntl.flock when running locally with a
+    shared filesystem; a Redis lock when work is distributed across hosts
+    (compute_backend != "local"). Local behavior is byte-for-byte unchanged.
+    """
+    if get_settings().compute_backend == "local":
+        async with _flock_analysis_lock(binary_sha256):
+            yield
+    else:
+        async with _redis_analysis_lock(binary_sha256):
+            yield
 
 
 def _compute_sha256(file_path: str) -> str:

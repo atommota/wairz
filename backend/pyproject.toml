@@ -26,6 +26,7 @@ dependencies = [
     "pyyaml>=6.0.0",
     "markdown>=3.6",
     "bleach>=6.1.0",
+    "redis>=5.0.0",
 ]
 
 [project.scripts]

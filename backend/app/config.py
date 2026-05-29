@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     aws_region: str = ""
     batch_job_queue: str = ""
     batch_job_definition: str = ""
+    # TTL (seconds) for the distributed analysis lock used when compute_backend
+    # != "local" (no shared filesystem for flock). Auto-renewed while held, so
+    # this only bounds how long a crashed holder blocks others.
+    redis_lock_ttl_seconds: int = 120
 
 
 @lru_cache

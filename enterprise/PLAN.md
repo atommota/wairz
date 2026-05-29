@@ -299,12 +299,24 @@ a phase complete without meeting it.
   `app/services/compute_dispatch.py` (`get_dispatcher()` → `LocalDispatcher`
   by default), wired into `binary.py`.
 
-### Phase 1 — State backbone (network, storage, db, cache)
+### Phase 1 — State backbone (network, storage, db, cache) — ✅ code DONE, apply pending
 - Implement `network`, `storage` (EFS + S3), `database` (Aurora SLv2), `cache`
   (Redis) modules.
 - App-code **C3** (Redis lock) and **C4** (EFS path verification).
-- **DoD:** `terraform apply` stands up VPC + EFS + Aurora + Redis; a throwaway
-  EC2/ECS task can mount the EFS access point and connect to Aurora + Redis.
+- **Implemented:** four Terraform modules + root wiring (`terraform validate` +
+  `fmt` clean). C3: `_cross_process_analysis_lock` dispatches on
+  `compute_backend` — `fcntl.flock` for `local` (unchanged), a renewing Redis
+  lock (`_redis_analysis_lock`, lazy `redis` import) otherwise; `redis>=5` added
+  to `pyproject` (cloud-only path). C4: `STORAGE_ROOT`/`GHIDRA_PROJECT_ROOT`
+  stay POSIX paths backed by EFS access points — verified no host-path
+  assumptions. New setting `redis_lock_ttl_seconds`.
+- **Verified:** suite 216 passed (local unchanged); Redis lock mutual-exclusion
+  + renewal proven against the running redis container (holder kept the lock
+  across a hold longer than the TTL; waiter blocked until release).
+- **DoD — apply pending an operator AWS account.** `terraform apply` (VPC + EFS
+  + Aurora + Redis) and the wired `_redis_analysis_lock` integration test both
+  need real AWS / a rebuilt image with `redis-py`; not runnable from the dev
+  environment. Code is review-ready.
 
 ### Phase 2 — Ghidra on Batch + persistent project store + warm worker
 This is the heaviest phase. Sub-steps, in order:
