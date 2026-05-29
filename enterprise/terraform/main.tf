@@ -30,35 +30,44 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# Module wiring (uncomment + fill in as each module lands per PLAN.md §6).
+# Module wiring. Phase 1 modules (network, storage, database, cache) are live;
+# later-phase modules stay commented until they land (PLAN.md §6).
 # ---------------------------------------------------------------------------
 
-# module "network" {
-#   source      = "./modules/network"
-#   name        = local.name
-#   aws_region  = var.aws_region
-# }
+module "network" {
+  source             = "./modules/network"
+  name               = local.name
+  aws_region         = var.aws_region
+  vpc_cidr           = var.vpc_cidr
+  create_nat_gateway = var.create_nat_gateway
+}
 
-# module "storage" {
-#   source         = "./modules/storage"
-#   name           = local.name
-#   vpc_id         = module.network.vpc_id
-#   private_subnets = module.network.private_subnet_ids
-# }
+module "storage" {
+  source             = "./modules/storage"
+  name               = local.name
+  vpc_id             = module.network.vpc_id
+  vpc_cidr           = module.network.vpc_cidr
+  private_subnet_ids = module.network.private_subnet_ids
+}
 
-# module "database" {
-#   source          = "./modules/database"
-#   name            = local.name
-#   min_capacity    = var.aurora_min_capacity
-#   max_capacity    = var.aurora_max_capacity
-#   private_subnets = module.network.private_subnet_ids
-# }
+module "database" {
+  source             = "./modules/database"
+  name               = local.name
+  vpc_id             = module.network.vpc_id
+  vpc_cidr           = module.network.vpc_cidr
+  private_subnet_ids = module.network.private_subnet_ids
+  min_capacity       = var.aurora_min_capacity
+  max_capacity       = var.aurora_max_capacity
+}
 
-# module "cache" {
-#   source          = "./modules/cache"
-#   name            = local.name
-#   private_subnets = module.network.private_subnet_ids
-# }
+module "cache" {
+  source             = "./modules/cache"
+  name               = local.name
+  vpc_id             = module.network.vpc_id
+  vpc_cidr           = module.network.vpc_cidr
+  private_subnet_ids = module.network.private_subnet_ids
+  node_type          = var.redis_node_type
+}
 
 # module "batch" {
 #   source        = "./modules/batch"

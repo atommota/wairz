@@ -27,6 +27,28 @@ variable "tags" {
   default     = {}
 }
 
+# --- Network (network module, Phase 1) -------------------------------------
+
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC."
+  type        = string
+  default     = "10.42.0.0/16"
+}
+
+variable "create_nat_gateway" {
+  description = "Use a NAT gateway for private egress instead of VPC endpoints. NAT ~$32/mo; endpoints cheaper at rest. See PLAN.md open decision #3."
+  type        = bool
+  default     = false
+}
+
+# --- Cache (cache module, Phase 1) ------------------------------------------
+
+variable "redis_node_type" {
+  description = "ElastiCache Redis node type."
+  type        = string
+  default     = "cache.t4g.micro"
+}
+
 # --- Application sizing / behavior knobs ------------------------------------
 
 variable "max_upload_size_mb" {
