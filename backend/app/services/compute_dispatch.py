@@ -64,6 +64,10 @@ class ComputeDispatcher:
     ) -> JobHandle:
         raise NotImplementedError
 
+    def dispatch_reuse_worker(self, idle_ttl_seconds: int) -> JobHandle:
+        """Start a long-lived reuse worker that drains the Redis script queue."""
+        raise NotImplementedError
+
 
 class LocalDispatcher(ComputeDispatcher):
     """Spawn detached worker subprocesses on the backend host (default).
@@ -166,6 +170,15 @@ class BatchDispatcher(ComputeDispatcher):
                 "--binary-path", binary_path,
                 "--sha256", sha256,
                 "--function-name", function_name,
+            ],
+        )
+
+    def dispatch_reuse_worker(self, idle_ttl_seconds: int) -> JobHandle:
+        return self._submit(
+            _job_name("wairz-reuse", str(idle_ttl_seconds)),
+            [
+                "python", "-m", "app.workers.run_reuse_worker",
+                "--idle-ttl", str(idle_ttl_seconds),
             ],
         )
 

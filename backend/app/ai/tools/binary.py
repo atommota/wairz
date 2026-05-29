@@ -1530,13 +1530,14 @@ async def _handle_start_function_decompile(
 
     await cache.mark_function_run_started(
         context.firmware_id, path, sha256, function_name, handle.pid,
-        context.db,
+        context.db, job_ref=handle.ref,
     )
     await context.db.commit()
 
+    worker_id = handle.ref or f"pid={handle.pid}"
     return (
         f"started - decompile kicked off for '{function_name}' in "
-        f"{os.path.basename(path)} (pid={handle.pid}). Poll "
+        f"{os.path.basename(path)} ({worker_id}). Poll "
         f"check_function_decompile_status until complete. Large handler "
         f"functions in firmware daemons typically take 1-15 min. The "
         f"worker has a 30-minute budget; if it fails with a timeout, "
@@ -1579,6 +1580,20 @@ async def _handle_check_function_decompile_status(
     status = status_row.get("status", "unknown")
     if status == "running":
         elapsed = int(time.time() - status_row.get("started_at", 0))
+        job_ref = status_row.get("job_ref")
+        if get_settings().compute_backend != "local":
+            state = describe_batch_job_state(job_ref)
+            if state == "failed":
+                return (
+                    f"failed - decompile job {job_ref} failed. Call "
+                    f"start_function_decompile again to retry."
+                )
+            if state in ("queued", "starting"):
+                return (
+                    f"{state} - decompile job {job_ref} {state} "
+                    f"({elapsed}s since submit; cold start ~1-3 min)."
+                )
+            return f"running - {elapsed}s elapsed (job {job_ref}, {state})"
         pid = status_row.get("pid")
         alive = pid is not None and _pid_is_alive(int(pid))
         if not alive and elapsed > 30:
@@ -1605,6 +1620,42 @@ def _pid_is_alive(pid: int) -> bool:
         # Process exists but we can't signal it — counts as alive.
         return True
     return True
+
+
+async def _handle_warm_analysis_worker(input: dict, context: ToolContext) -> str:
+    """Pre-start the cloud reuse worker so interactive Ghidra queries are fast."""
+    settings = get_settings()
+    if settings.compute_backend == "local":
+        return (
+            "not_applicable - the warm analysis worker only applies in cloud "
+            "mode (compute_backend != local); locally Ghidra runs in-process."
+        )
+
+    import redis.asyncio as aioredis
+
+    from app.services.ghidra_service import _REUSE_WORKER_HB, ensure_reuse_worker
+
+    ttl_minutes = int(
+        input.get("ttl_minutes", settings.re_worker_idle_ttl_minutes),
+    )
+    client = aioredis.from_url(settings.redis_url)
+    try:
+        already = bool(await client.exists(_REUSE_WORKER_HB))
+        ref = await ensure_reuse_worker(client, ttl_minutes * 60)
+    finally:
+        await client.aclose()
+
+    if already:
+        return (
+            f"warm - a reuse analysis worker is already running. decompile / "
+            f"find_string_refs / layout / dataflow calls run on it in seconds. "
+            f"Idle timeout ~{ttl_minutes}m, extended by activity."
+        )
+    return (
+        f"starting - reuse analysis worker dispatched (job {ref}); cold start "
+        f"~1-3 min, then queries run in seconds. Idle timeout ~{ttl_minutes}m, "
+        f"extended by activity. Poll a quick query or just proceed."
+    )
 
 
 def register_binary_tools(registry: ToolRegistry) -> None:
@@ -1716,6 +1767,33 @@ def register_binary_tools(registry: ToolRegistry) -> None:
             "required": ["binary_path", "function_name"],
         },
         handler=_handle_check_function_decompile_status,
+    )
+
+    registry.register(
+        name="warm_analysis_worker",
+        description=(
+            "(Cloud only) Pre-start a warm Ghidra worker so interactive query "
+            "tools — decompile_function, find_string_refs, get_stack_layout, "
+            "get_global_layout, trace_dataflow — return in seconds instead of "
+            "paying a ~1-3 min cold start each. Call this when you're about to "
+            "do a burst of binary RE on a project that's already been analyzed "
+            "(start_binary_analysis). The worker stays warm while you keep "
+            "querying and shuts down automatically when idle. No-op locally."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "ttl_minutes": {
+                    "type": "integer",
+                    "description": (
+                        "Idle minutes before the worker shuts down (extended by "
+                        "activity). Defaults to the server setting (~20)."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        handler=_handle_warm_analysis_worker,
     )
 
     registry.register(

@@ -221,6 +221,19 @@ def _parse_decompile_output(raw_output: str) -> str | None:
 _PROJECT_NAME = "wairz"
 _ANALYZED_MARKER = ".wairz_analyzed"
 
+# --- Reuse-worker queue (cloud mode) ----------------------------------------
+# In cloud mode the backend is a small Fargate task that must NOT run Ghidra
+# itself. Query scripts (decompile/string-refs/layouts/dataflow) are delegated
+# over Redis to a warm "reuse worker" Batch job that runs -process against the
+# shared EFS project. See enterprise/PLAN.md §3.2 (C8).
+_REUSE_QUEUE = "wairz:ghidra:reuse:q"
+_REUSE_RESULT_PREFIX = "wairz:ghidra:reuse:res:"
+_REUSE_WORKER_HB = "wairz:ghidra:reuse:worker:hb"      # worker liveness (TTL)
+_REUSE_WORKER_SUBMIT = "wairz:ghidra:reuse:worker:submit"  # de-dupe submits
+_REUSE_RESULT_TTL = 120          # seconds a result waits to be collected
+_REUSE_DISPATCH_GRACE = 240      # extra wait budget for a cold worker (boot)
+_REUSE_SUBMIT_TTL = 300          # how long a "submitting" marker holds
+
 
 @lru_cache(maxsize=1)
 def _ghidra_version() -> str:
@@ -527,35 +540,24 @@ async def _gc_project_store() -> None:
         logger.warning("Project-store GC failed (non-fatal)", exc_info=True)
 
 
-async def run_ghidra_subprocess(
+async def _run_ghidra_local(
     binary_path: str,
     script_name: str,
-    script_args: list[str] | None = None,
-    timeout: int | None = None,
-    binary_sha256: str | None = None,
+    script_args: list[str] | None,
+    effective_timeout: int,
+    binary_sha256: str,
 ) -> str:
-    """Run a Ghidra headless script, reusing a persistent per-binary project.
+    """Actually run Ghidra on THIS host against the persistent project.
 
-    On first touch the binary is imported + auto-analyzed once into a persistent
-    project; the script then runs against that project. Every subsequent call
-    reuses the project via -process -readOnly -noanalysis (no re-import, no
-    re-analysis) — turning minutes into seconds and sharing the work across
-    sessions, agents, and users.
-
-    timeout: optional override (seconds). Defaults to settings.ghidra_timeout,
-    appropriate for synchronous MCP-bounded calls. Background workers pass a
-    much larger value. The whole operation (import-if-needed + script) is bound
-    by this single timeout, preserving the prior synchronous-call semantics.
-
-    binary_sha256: pass it if already computed, to skip a re-hash.
+    On first touch the binary is imported + auto-analyzed once; the script then
+    runs against that project, and every later call reuses it via
+    -process -readOnly -noanalysis. This is the executor for local mode AND for
+    the cloud reuse worker (which calls it directly on its Batch instance).
     """
-    effective_timeout = timeout if timeout is not None else get_settings().ghidra_timeout
-    if binary_sha256 is None:
-        binary_sha256 = await asyncio.to_thread(_compute_sha256, binary_path)
-
-    # Serialize all headless access to this binary's project (import or reuse)
-    # at the OS level: a local Ghidra project allows only one headless process
-    # at a time, and this also dedupes concurrent first-touch imports.
+    # Serialize all headless access to this binary's project (import or reuse):
+    # a local Ghidra project allows only one headless process at a time, and
+    # this also dedupes concurrent first-touch imports. The lock is flock
+    # locally and Redis-backed in cloud (see _cross_process_analysis_lock).
     async with _cross_process_analysis_lock(binary_sha256):
         imported = await _ensure_project_imported(
             binary_path, binary_sha256, effective_timeout,
@@ -566,6 +568,109 @@ async def run_ghidra_subprocess(
         return await _run_process_script(
             binary_sha256, script_name, script_args, effective_timeout,
         )
+
+
+async def run_ghidra_subprocess(
+    binary_path: str,
+    script_name: str,
+    script_args: list[str] | None = None,
+    timeout: int | None = None,
+    binary_sha256: str | None = None,
+) -> str:
+    """Run a Ghidra headless script against the persistent per-binary project.
+
+    Dispatches on compute_backend: locally it runs Ghidra in-process
+    (_run_ghidra_local); in cloud mode it delegates to the warm reuse worker
+    over Redis (_run_ghidra_remote) so the small Fargate backend never runs
+    Ghidra. Either way the result is identical. timeout defaults to
+    settings.ghidra_timeout; pass binary_sha256 to skip a re-hash.
+    """
+    effective_timeout = timeout if timeout is not None else get_settings().ghidra_timeout
+    if binary_sha256 is None:
+        binary_sha256 = await asyncio.to_thread(_compute_sha256, binary_path)
+
+    if get_settings().compute_backend == "local":
+        return await _run_ghidra_local(
+            binary_path, script_name, script_args, effective_timeout, binary_sha256,
+        )
+    return await _run_ghidra_remote(
+        binary_path, script_name, script_args, effective_timeout, binary_sha256,
+    )
+
+
+async def ensure_reuse_worker(client, idle_ttl_seconds: int) -> str | None:
+    """Ensure one reuse worker is running; submit one if none is alive.
+
+    Returns the submitted job ref (or None if a worker was already alive / a
+    submit was already in flight). De-duped via a Redis NX marker so concurrent
+    callers don't spawn a fleet.
+    """
+    if await client.exists(_REUSE_WORKER_HB):
+        return None
+    # Only one caller wins the right to submit; others see the marker and skip.
+    if not await client.set(
+        _REUSE_WORKER_SUBMIT, "1", nx=True, ex=_REUSE_SUBMIT_TTL,
+    ):
+        return None
+    from app.services.compute_dispatch import get_dispatcher
+
+    handle = get_dispatcher().dispatch_reuse_worker(idle_ttl_seconds)
+    logger.info("Started reuse worker job %s (idle_ttl=%ds)", handle.ref, idle_ttl_seconds)
+    return handle.ref
+
+
+async def _run_ghidra_remote(
+    binary_path: str,
+    script_name: str,
+    script_args: list[str] | None,
+    effective_timeout: int,
+    binary_sha256: str,
+) -> str:
+    """Delegate a Ghidra script run to the warm reuse worker over Redis.
+
+    Enqueues the request, ensures a worker is running (auto-starting one if
+    none — a cold start adds ~1-3 min; warm_analysis_worker avoids it), then
+    blocks on the per-request result list up to the timeout + a cold-start
+    grace. Raises on worker error or timeout.
+    """
+    import json
+
+    import redis.asyncio as aioredis
+
+    settings = get_settings()
+    client = aioredis.from_url(settings.redis_url)
+    req_id = uuid.uuid4().hex
+    result_key = f"{_REUSE_RESULT_PREFIX}{req_id}"
+    payload = json.dumps({
+        "id": req_id,
+        "binary_path": binary_path,
+        "script_name": script_name,
+        "script_args": script_args,
+        "binary_sha256": binary_sha256,
+        "timeout": effective_timeout,
+    })
+    try:
+        await client.rpush(_REUSE_QUEUE, payload)
+        await ensure_reuse_worker(
+            client, settings.re_worker_idle_ttl_minutes * 60,
+        )
+        # BLPOP blocks efficiently until the worker pushes the result.
+        wait = int(effective_timeout) + _REUSE_DISPATCH_GRACE
+        popped = await client.blpop([result_key], timeout=wait)
+        if popped is None:
+            raise TimeoutError(
+                f"reuse worker did not return within {wait}s for {script_name} "
+                f"(sha256={binary_sha256[:12]}); is a worker running? "
+                f"Try warm_analysis_worker."
+            )
+        _, raw = popped
+        res = json.loads(raw)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "reuse worker error"))
+        return res["output"]
+    finally:
+        with contextlib.suppress(Exception):
+            await client.aclose()
 
 
 class GhidraAnalysisCache:
@@ -800,6 +905,26 @@ class GhidraAnalysisCache:
         if await self._is_analysis_complete(firmware_id, binary_sha256, db):
             return binary_sha256
 
+        # Cloud mode: the full analysis (which populates the DB cache) is a heavy
+        # job that must run on Batch, not this small Fargate backend. Auto-submit
+        # it (idempotent) and tell the caller to poll — never run Ghidra here.
+        if get_settings().compute_backend != "local":
+            from app.services.compute_dispatch import get_dispatcher
+
+            handle = get_dispatcher().dispatch_analysis(
+                firmware_id, binary_path, binary_sha256,
+            )
+            await self.mark_run_started(
+                firmware_id, binary_path, binary_sha256, None, db,
+                job_ref=handle.ref,
+            )
+            await db.commit()
+            raise RuntimeError(
+                f"analysis not ready for {os.path.basename(binary_path)} "
+                f"(dispatched job {handle.ref}). Poll check_binary_analysis_status "
+                f"until 'complete', then retry."
+            )
+
         # Concurrency guard
         async with self._lock:
             if binary_sha256 in self._analysis_locks:
@@ -936,13 +1061,17 @@ class GhidraAnalysisCache:
         binary_path: str,
         binary_sha256: str,
         function_name: str,
-        pid: int,
+        pid: int | None,
         db: AsyncSession,
+        job_ref: str | None = None,
     ) -> None:
         await self._store_cached(
             firmware_id, binary_path, binary_sha256,
             f"function_decompile_run:{function_name}",
-            {"status": "running", "started_at": time.time(), "pid": pid},
+            {
+                "status": "running", "started_at": time.time(),
+                "pid": pid, "job_ref": job_ref,
+            },
             db,
         )
 

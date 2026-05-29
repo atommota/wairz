@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # != "local" (no shared filesystem for flock). Auto-renewed while held, so
     # this only bounds how long a crashed holder blocks others.
     redis_lock_ttl_seconds: int = 120
+    # Idle timeout for the cloud "reuse worker" (C8). It stays warm while reuse
+    # requests keep arriving and exits after this long with an empty queue.
+    re_worker_idle_ttl_minutes: int = 20
 
 
 @lru_cache
