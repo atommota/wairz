@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     max_tool_iterations: int = 25
     ghidra_path: str = "/opt/ghidra"
     ghidra_scripts_path: str = "/opt/ghidra_scripts"
+    # Persistent Ghidra project store. A binary is imported + auto-analyzed once
+    # into <ghidra_project_root>/<ghidra_version>/<sha256>/ and kept; subsequent
+    # scripts reuse it via -process (no re-analysis), so analysis done once is
+    # shared across sessions/agents/users. Back this with a durable volume.
+    ghidra_project_root: str = "/data/ghidra_projects"
+    # Project-store GC: evict least-recently-used projects once the store
+    # exceeds this many projects (0 disables GC). Keyed by access time.
+    ghidra_project_cache_max: int = 200
     ghidra_timeout: int = 300
     ghidra_background_analysis_timeout: int = 3600
     ghidra_background_decompile_timeout: int = 1800

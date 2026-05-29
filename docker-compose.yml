@@ -54,6 +54,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - firmware_data:/data/firmware
+      - ghidra_projects:/data/ghidra_projects
       - ./ghidra/scripts:/opt/ghidra_scripts:ro
       - ./emulation/kernels:/opt/kernels:rw
       - /var/run/docker.sock:/var/run/docker.sock
@@ -118,6 +119,7 @@ volumes:
   pgdata:
   redisdata:
   firmware_data:
+  ghidra_projects:
 
 networks:
   emulation_net:

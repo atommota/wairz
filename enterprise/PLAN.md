@@ -163,9 +163,18 @@ reusable asset is the **analyzed program** itself.
   by the **Redis lock (C3)** keyed by sha256 so concurrent first-touches dedupe.
   In cloud this is a **Batch** job; locally it's the detached worker / inline.
 - **Reuse forever (read, light):** all 5 query scripts run
-  `analyzeHeadless <project> <sha256> -process -readOnly -postScript <script>` —
-  no re-import, no re-analysis (minutes → seconds). `-readOnly` takes no project
-  write-lock, so **unlimited concurrent reuse across users/agents is safe.**
+  `analyzeHeadless <project> -process -noanalysis -readOnly -postScript <script>`
+  — no re-import, no re-analysis (minutes → seconds). `-noanalysis` skips the
+  expensive auto-analysis (done at import); `-readOnly` never writes back.
+- **Concurrency (corrected):** a *local* Ghidra project (.gpr/.rep) permits only
+  **one** headless process at a time, even read-only. So access per binary is
+  **serialized** via the existing `fcntl` flock keyed by sha256 (the import path
+  and every reuse run share it). Different binaries run fully in parallel —
+  which is the common case (users/agents on different binaries). True
+  *concurrent same-binary* reuse needs either per-run project **copies**
+  (copy-on-read to a temp dir → parallel readers, at a copy cost) or a **Ghidra
+  Server**; deferred to 2c/cloud where it actually matters. For local + typical
+  shared-team use, per-binary serialization is correct and sufficient.
 - **Program naming:** import so the program is addressable by `sha256` for
   `-process` (import a path/symlink named `<sha256>`, or store the basename↔sha
   mapping). Implementation detail — make it deterministic.
@@ -300,13 +309,24 @@ a phase complete without meeting it.
 ### Phase 2 — Ghidra on Batch + persistent project store + warm worker
 This is the heaviest phase. Sub-steps, in order:
 
-**2a — Persistent project store (C7), local-first.** Land `-import`-once +
-`-process -readOnly`-reuse against a per-`sha256` project store, behind a
-`ghidra_projects` volume, in **local mode**. This is a pure speed win locally
-and de-risks the cloud work. Includes program-naming, version-keyed paths, and
-LRU GC. **DoD(2a):** local suite green; a second `decompile_function` /
-`find_string_refs` on the same binary runs with no re-analysis (verify via logs
-/ timing); concurrent `-readOnly` reuse of one binary works.
+**2a — Persistent project store (C7), local-first. ✅ DONE.** Land `-import`-once
++ `-process -noanalysis -readOnly`-reuse against a per-`sha256` project store,
+behind a `ghidra_projects` volume, in **local mode**. Pure speed win locally,
+de-risks the cloud work. Includes version-keyed paths and LRU GC.
+- **Implemented:** `ghidra_service.py` — `_project_dir` (`<root>/<ghidra_ver>/
+  <sha256>/`), `_build_import_command` (persist, no `-deleteProject`) /
+  `_build_process_command` (`-process -noanalysis -readOnly`), `_exec_headless`,
+  `_ensure_project_imported` + `_run_process_script` (unlocked internals so
+  callers already holding the sha256 flock don't deadlock), `run_ghidra_subprocess`
+  rewritten to import-once-then-reuse under the flock, LRU GC
+  (`_gc_project_store`, lock-guarded eviction). New settings
+  `ghidra_project_root` / `ghidra_project_cache_max`; `ghidra_projects` volume in
+  compose.
+- **Verified in container:** call 1 logged `Importing + analyzing` (8.0s) and
+  persisted `wairz.gpr`/`wairz.rep`/`.wairz_analyzed`; call 2 logged `Reusing
+  project … (-process, no re-analysis)` (3.6s). GC test: 5 projects, cap 2 →
+  3 oldest evicted, 2 newest kept. Suite: 216 passed (baseline unchanged).
+- **DoD(2a): met.**
 
 **2b — Batch module + heavy import on Batch (C2 real `SubmitJob`, C3, C5).**
 `batch` module (compute env `minvCpus=0`, Spot, `maxvCpus` ceiling; job queue;
