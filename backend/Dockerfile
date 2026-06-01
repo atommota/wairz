@@ -129,8 +129,12 @@ COPY --from=kernels . /opt/kernels/
 # mount — without baking them in, every analyzeHeadless -postScript fails.
 COPY --from=ghidra_scripts . /opt/ghidra_scripts/
 
-# Create data and Ghidra project directories
-RUN mkdir -p /data/firmware /tmp/ghidra_projects \
+# Create data and Ghidra project directories.
+# /data/ghidra_projects must exist (and be wairz-owned) in the image so that
+# when the empty named volume is first mounted there, Docker seeds the volume
+# with wairz ownership instead of defaulting the mountpoint to root:root —
+# otherwise the backend (uid 1000) can't create the versioned project subdir.
+RUN mkdir -p /data/firmware /data/ghidra_projects /tmp/ghidra_projects \
     && chown -R wairz:wairz /data /app /tmp/ghidra_projects /opt/ghidra /opt/kernels /opt/ghidra_scripts
 
 USER wairz
