@@ -13,7 +13,7 @@ import re
 import socket
 import tempfile
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiofiles
 import httpx
@@ -144,6 +144,27 @@ class KernelService:
 
         return None
 
+    def _dtb_path(self, kernel_name: str) -> str | None:
+        """Return the path to a kernel's companion device-tree blob, if any.
+
+        Checks the sidecar JSON for an explicit 'dtb' field, then falls back to
+        the convention: <kernel_name>.dtb. DT-only kernels (e.g. the bundled
+        dhruvvyas90 buster RPi kernel) need a matching dtb passed via -dtb or
+        they fail with "invalid dtb and unrecognized/unsupported machine ID".
+        """
+        sidecar = self._read_sidecar(kernel_name)
+        if sidecar and sidecar.get("dtb"):
+            path = os.path.join(self._kernel_dir, sidecar["dtb"])
+            if os.path.isfile(path):
+                return path
+
+        # Convention fallback
+        path = os.path.join(self._kernel_dir, f"{kernel_name}.dtb")
+        if os.path.isfile(path):
+            return path
+
+        return None
+
     def _kernel_info(self, name: str) -> dict:
         """Build kernel info dict for a single kernel."""
         kernel_path = self._kernel_path(name)
@@ -166,9 +187,9 @@ class KernelService:
             description = ""
             uploaded_at = mtime
 
-        # Check for companion initrd
-        initrd_path = self._initrd_path(name)
-        has_initrd = initrd_path is not None
+        # Check for companion initrd / device-tree blob
+        has_initrd = self._initrd_path(name) is not None
+        has_dtb = self._dtb_path(name) is not None
 
         return {
             "name": name,
@@ -177,6 +198,7 @@ class KernelService:
             "file_size": file_size,
             "uploaded_at": uploaded_at,
             "has_initrd": has_initrd,
+            "has_dtb": has_dtb,
         }
 
     def list_kernels(self, architecture: str | None = None) -> list[dict]:
@@ -191,7 +213,7 @@ class KernelService:
                 continue
             if entry.name.endswith(".json"):
                 continue
-            if entry.name.endswith(".initrd"):
+            if entry.name.endswith((".initrd", ".dtb")):
                 continue
             if not entry.is_file():
                 continue
@@ -322,31 +344,13 @@ class KernelService:
         # Import here to avoid circular dependency at module level
         from app.services.emulation_service import _validate_kernel_file
 
-        # --- URL validation ---
-        _validate_download_url(url)
-
-        # --- Download with streaming ---
+        # --- Download (SSRF-safe, redirect-following) ---
         tmp_fd, tmp_path = tempfile.mkstemp(prefix="kernel_dl_")
         os.close(tmp_fd)
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                max_redirects=5,
-                timeout=httpx.Timeout(timeout_seconds, connect=30.0),
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    downloaded = 0
-                    async with aiofiles.open(tmp_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            downloaded += len(chunk)
-                            if downloaded > max_size_bytes:
-                                raise ValueError(
-                                    f"Download exceeds maximum size "
-                                    f"({max_size_bytes // (1024*1024)}MB)"
-                                )
-                            await f.write(chunk)
-
+            downloaded = await self._stream_download(
+                url, tmp_path, max_size_bytes, timeout_seconds
+            )
             if downloaded == 0:
                 raise ValueError("Downloaded file is empty")
 
@@ -371,13 +375,126 @@ class KernelService:
                     await f.write(json.dumps(sidecar, indent=2))
 
             return result
-
-        except httpx.HTTPStatusError as exc:
-            raise ValueError(
-                f"HTTP {exc.response.status_code} downloading kernel from {url}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise ValueError(f"Failed to download kernel: {exc}") from exc
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    async def download_companion(
+        self,
+        kernel_name: str,
+        url: str,
+        kind: str,
+        max_size_bytes: int = 64 * 1024 * 1024,
+        timeout_seconds: int = 120,
+    ) -> dict:
+        """Download an initrd or device-tree blob and pair it with a kernel.
+
+        ``kind`` is "initrd" or "dtb". The file is saved as
+        ``<kernel_name>.<kind>`` and recorded in the kernel's sidecar so it is
+        auto-attached at boot. DT-only / modular kernels need these companions
+        (a dtb to identify the board, an initrd to load storage/fs drivers) and
+        the carving sandbox is networkless, so this is how the agent fetches
+        them.
+        """
+        if kind not in ("initrd", "dtb"):
+            raise ValueError("kind must be 'initrd' or 'dtb'")
+        _validate_kernel_name(kernel_name)
+        if not os.path.isfile(self._kernel_path(kernel_name)):
+            raise ValueError(f"Kernel '{kernel_name}' not found")
+
+        companion_name = f"{kernel_name}.{kind}"
+        dest = os.path.join(self._kernel_dir, companion_name)
+        # Stage the temp file in the destination directory (not /tmp) so the
+        # final os.replace() stays on the same filesystem — moving across
+        # filesystems (tmpfs → the kernels volume) raises EXDEV. The leading
+        # dot keeps the partial file out of list_kernels until it's complete.
+        os.makedirs(self._kernel_dir, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=f".{kind}_dl_", dir=self._kernel_dir)
+        os.close(tmp_fd)
+        try:
+            downloaded = await self._stream_download(
+                url, tmp_path, max_size_bytes, timeout_seconds
+            )
+            if downloaded == 0:
+                raise ValueError("Downloaded file is empty")
+            # Light sanity check for device-tree blobs: FDT magic 0xd00dfeed.
+            if kind == "dtb":
+                with open(tmp_path, "rb") as f:
+                    magic = f.read(4)
+                if magic != b"\xd0\x0d\xfe\xed":
+                    raise ValueError(
+                        "Downloaded file is not a flattened device tree "
+                        "(bad FDT magic) — expected a .dtb"
+                    )
+            os.replace(tmp_path, dest)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        # Record the companion in the sidecar so it is auto-attached.
+        sidecar = self._read_sidecar(kernel_name) or {}
+        sidecar[kind] = companion_name
+        sidecar[f"{kind}_source_url"] = url
+        async with aiofiles.open(self._sidecar_path(kernel_name), "w") as f:
+            await f.write(json.dumps(sidecar, indent=2))
+
+        logger.info(
+            "Downloaded %s (%d bytes) for kernel %s from %s",
+            companion_name, downloaded, kernel_name, url,
+        )
+        return self._kernel_info(kernel_name)
+
+    async def _stream_download(
+        self,
+        url: str,
+        dest_path: str,
+        max_size_bytes: int,
+        timeout_seconds: int,
+    ) -> int:
+        """Stream a URL to ``dest_path``, returning bytes written.
+
+        Follows redirects MANUALLY so every hop — including cross-host
+        redirects to regional mirrors (e.g. downloads.openwrt.org → a country
+        mirror) — is re-validated against the SSRF policy before we connect to
+        it. httpx's built-in follow_redirects would skip that re-check, and
+        some mirrors 404 a request without a normal User-Agent.
+        """
+        headers = {"User-Agent": "wairz-kernel-downloader/1.0"}
+        current = url
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=httpx.Timeout(timeout_seconds, connect=30.0),
+                headers=headers,
+            ) as client:
+                for _hop in range(10):
+                    _validate_download_url(current)
+                    async with client.stream("GET", current) as response:
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise ValueError(
+                                    f"HTTP {response.status_code} redirect with no "
+                                    f"Location header from {current}"
+                                )
+                            current = urljoin(current, location)
+                            continue
+                        response.raise_for_status()
+                        downloaded = 0
+                        async with aiofiles.open(dest_path, "wb") as f:
+                            async for chunk in response.aiter_bytes(chunk_size=65536):
+                                downloaded += len(chunk)
+                                if downloaded > max_size_bytes:
+                                    raise ValueError(
+                                        f"Download exceeds maximum size "
+                                        f"({max_size_bytes // (1024*1024)}MB)"
+                                    )
+                                await f.write(chunk)
+                        return downloaded
+                raise ValueError(f"Too many redirects downloading from {url}")
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"HTTP {exc.response.status_code} downloading from {current}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ValueError(f"Failed to download: {exc}") from exc
