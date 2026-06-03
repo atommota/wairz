@@ -127,6 +127,42 @@ _SYSTEM_OVERRIDE_PROPERTIES = {
             "virtio-rng-pci' or '-dtb /tmp/board.dtb'."
         ),
     },
+    "extra_drives": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Firmware-relative path to a disk/partition image "
+                        "(e.g. '/_carved/mmcblk0p3.img')."
+                    ),
+                },
+                "mount": {
+                    "type": "string",
+                    "description": (
+                        "Optional absolute guest path to mount it at before "
+                        "firmware init runs (e.g. '/data')."
+                    ),
+                },
+                "fstype": {
+                    "type": "string",
+                    "description": "Optional filesystem type for the mount (e.g. 'ext4', 'vfat').",
+                },
+            },
+            "required": ["path"],
+        },
+        "description": (
+            "Additional disk/partition images to attach as extra drives. "
+            "Attached after the root disk on the same bus (virtio→/dev/vdb,…; "
+            "ide→/dev/sdb,…) and, when 'mount' is set, mounted by the init "
+            "wrapper before firmware init. Use for devices whose config/data "
+            "lives on a separate flash/MMC partition not in the root image — "
+            "carve the partition from the raw image with run_shell, then map it "
+            "here (e.g. MBR p3 → mount '/data')."
+        ),
+    },
 }
 
 # Keys that map 1:1 from input/preset to start_session kwargs. `initrd` is the
@@ -432,6 +468,50 @@ def register_emulation_tools(registry: ToolRegistry) -> None:
             "required": ["session_id", "command"],
         },
         handler=_handle_run_command,
+        applies_to=("linux",),
+    )
+
+    registry.register(
+        name="inject_file_to_emulation",
+        description=(
+            "Write a file into a running emulation session reliably — use this "
+            "instead of pasting base64 over run_command_in_emulation, which is "
+            "flaky for binary data and has unreliable exit codes. Provide the "
+            "content as base64 (content_base64) OR a firmware-relative source "
+            "path on the host (host_path). For system mode the payload is "
+            "streamed over the serial console in chunks, decoded guest-side, and "
+            "the written size is verified; for user mode it's written straight "
+            "into the chroot rootfs. Ideal for injecting a device's config/data "
+            "file (e.g. a decrypted config.xml into /data) or a small helper "
+            "binary. For large data, attach it as an extra_drive instead."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "The emulation session ID"},
+                "guest_path": {
+                    "type": "string",
+                    "description": "Absolute destination path inside the guest (e.g. '/data/config.xml')",
+                },
+                "content_base64": {
+                    "type": "string",
+                    "description": "File content, base64-encoded. Mutually exclusive with host_path.",
+                },
+                "host_path": {
+                    "type": "string",
+                    "description": (
+                        "Firmware-relative path to a source file on the host to inject "
+                        "(e.g. '/_carved/dec_config.xml'). Mutually exclusive with content_base64."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Optional octal file mode for the destination (e.g. '0644', '0755').",
+                },
+            },
+            "required": ["session_id", "guest_path"],
+        },
+        handler=_handle_inject_file,
         applies_to=("linux",),
     )
 
@@ -888,6 +968,7 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
     overrides = {k: input.get(k) for k in _SYSTEM_OVERRIDE_KEYS if input.get(k) is not None}
     initrd_path = input.get("initrd")
     dtb_path = input.get("dtb")
+    extra_drives = input.get("extra_drives") or None
 
     if mode == "user" and not binary_path:
         return "Error: binary_path is required for user-mode emulation."
@@ -922,6 +1003,7 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
             stub_profile=stub_profile,
             initrd_path=initrd_path,
             dtb_path=dtb_path,
+            extra_drives=extra_drives,
             **overrides,
         )
         await context.db.commit()
@@ -960,6 +1042,11 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
             applied["initrd"] = initrd_path
         if dtb_path:
             applied["dtb"] = dtb_path
+        if extra_drives:
+            applied["extra_drives"] = ", ".join(
+                f"{d.get('path')}{'→' + d['mount'] if d.get('mount') else ''}"
+                for d in extra_drives
+            )
         if applied:
             lines.append(
                 "QEMU overrides: "
@@ -1087,6 +1174,56 @@ async def _handle_run_command(input: dict, context: ToolContext) -> str:
     return output
 
 
+async def _handle_inject_file(input: dict, context: ToolContext) -> str:
+    """Inject a file into a running emulation session."""
+    import base64
+    import binascii
+    from uuid import UUID
+
+    session_id = input.get("session_id")
+    guest_path = (input.get("guest_path") or "").strip()
+    content_b64 = input.get("content_base64")
+    host_path = input.get("host_path")
+    mode = input.get("mode")
+
+    if not session_id or not guest_path:
+        return "Error: session_id and guest_path are required."
+    if bool(content_b64) == bool(host_path):
+        return "Error: provide exactly one of content_base64 or host_path."
+
+    # Resolve the payload bytes.
+    if content_b64:
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return "Error: content_base64 is not valid base64."
+    else:
+        try:
+            real = context.resolve_path(host_path)
+        except Exception as exc:
+            return f"Error: host_path could not be resolved: {exc}"
+        if not os.path.isfile(real):
+            return f"Error: host_path not found: {host_path}"
+        with open(real, "rb") as f:
+            data = f.read()
+
+    svc = EmulationService(context.db)
+    try:
+        result = await svc.inject_file(UUID(session_id), guest_path, data, mode=mode)
+    except ValueError as exc:
+        return f"Error injecting file: {exc}"
+    except Exception as exc:
+        return f"Error injecting file: {exc}"
+
+    verified = "verified" if result["verified"] else (
+        f"WARNING size mismatch (guest reports {result['guest_size']!r})"
+    )
+    return (
+        f"Injected {result['bytes']} bytes to {guest_path} "
+        f"({result['mode']} mode) — {verified}."
+    )
+
+
 async def _handle_stop_emulation(input: dict, context: ToolContext) -> str:
     """Stop an emulation session."""
     session_id = input.get("session_id")
@@ -1211,6 +1348,25 @@ async def _handle_diagnose_environment(input: dict, context: ToolContext) -> str
     issues: list[str] = []
     info: list[str] = []
     suggestions: list[str] = []
+
+    # --- 0. ARM ISA / board compatibility (feedback #5) ---
+    # The arch string is normalised to "arm", which hides whether the userland
+    # is ARMv7/hard-float (armhf). An armhf userland SIGILLs instantly on the
+    # legacy versatilepb default (ARMv5/v6), panicking with "Attempted to kill
+    # init". start_emulation now auto-detects this and steers to -M virt; flag
+    # it here so the agent understands the board choice and any override risk.
+    if (arch or "").lower() in ("arm", "armhf", "armel"):
+        from app.services.emulation_service import EmulationService
+        if EmulationService._detect_arm_isa(fs_root) == "armv7-hf":
+            info.append(
+                "ARMv7 / HARD-FLOAT (armhf) USERLAND DETECTED: system-mode "
+                "emulation will auto-select -M virt + cpu=cortex-a15 + "
+                "drive_interface=virtio (root=/dev/vda) and a virt-capable "
+                "kernel (e.g. openwrt-armvirt32). The default ARM board "
+                "(versatilepb) is ARMv5/v6 and would SIGILL init immediately "
+                "('Kernel panic - Attempted to kill init'). If you manually "
+                "override machine to versatilepb, expect that panic."
+            )
 
     # --- 1. Check for broken /dev/null symlinks ---
     broken_symlinks = []
@@ -2013,6 +2169,44 @@ async def _handle_troubleshoot_emulation(input: dict, context: ToolContext) -> s
         switch_root_lines,
     )
 
+    # 3c. ARMv7/hard-float userland on an ARMv5/v6 board → instant SIGILL.
+    isa_sigill_lines = [
+        "## Immediate SIGILL / 'Attempted to kill init' on ARM",
+        "",
+        "Boot reaches `Run /init as init process` (or the firmware's init) and",
+        "panics instantly:",
+        "",
+        "    Internal error: Oops - undefined instruction",
+        "    Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000004",
+        "",
+        "**Cause: ISA mismatch.** The userland is ARMv7/hard-float (armhf, VFP),",
+        "but the board/CPU is ARMv5/v6 (the legacy versatilepb default runs",
+        "arm926/arm1176). The first VFP instruction init executes is undefined on",
+        "that CPU, so the kernel kills init.",
+        "",
+        "**This is now auto-handled:** start_emulation sniffs the rootfs ELFs and,",
+        "when it sees an ARMv7/hard-float userland, selects `-M virt`,",
+        "`cpu=cortex-a15`, `drive_interface=virtio`, `root=/dev/vda`, and a",
+        "virt-capable kernel (openwrt-armvirt32). Run `diagnose_emulation_environment`",
+        "— it reports 'ARMv7 / HARD-FLOAT USERLAND DETECTED' when this applies.",
+        "",
+        "If you still hit the panic:",
+        "- You likely overrode `machine` back to versatilepb. Drop the override,",
+        "  or set machine=virt, cpu=cortex-a15, drive_interface=virtio,",
+        "  root_dev=/dev/vda explicitly.",
+        "- Ensure a virt-capable kernel is selected (list_available_kernels; the",
+        "  one whose description says '-M virt'). versatile/RPi kernels won't boot",
+        "  on virt and vice-versa — kernel and machine must match.",
+    ]
+    sections["isa_sigill"] = (
+        [
+            "undefined instruction", "sigill", "illegal instruction",
+            "exitcode=0x00000004", "exitcode=0x04", "vfp", "oops",
+            "armv7", "hard-float", "hardfloat",
+        ],
+        isa_sigill_lines,
+    )
+
     # 4. MTD / flash errors
     mtd_lines = [
         "## MTD / Flash Errors",
@@ -2567,6 +2761,7 @@ async def _handle_save_preset(input: dict, context: ToolContext) -> str:
             stub_profile=input.get("stub_profile", "none"),
             initrd_path=input.get("initrd"),
             dtb_path=input.get("dtb"),
+            extra_drives=input.get("extra_drives") or None,
             **overrides,
         )
         await context.db.commit()
@@ -2633,7 +2828,14 @@ def _preset_overrides_summary(p: EmulationPreset) -> str:
         ("drive_interface", p.drive_interface), ("root_dev", p.root_dev),
         ("qemu_extra_args", p.qemu_extra_args),
     ]
-    return ", ".join(f"{k}={v}" for k, v in fields if v)
+    summary = ", ".join(f"{k}={v}" for k, v in fields if v)
+    if p.extra_drives:
+        drives = ", ".join(
+            f"{d.get('path')}{'→' + d['mount'] if d.get('mount') else ''}"
+            for d in p.extra_drives
+        )
+        summary = f"{summary}, extra_drives=[{drives}]" if summary else f"extra_drives=[{drives}]"
+    return summary
 
 
 async def _handle_start_from_preset(input: dict, context: ToolContext) -> str:
@@ -2689,6 +2891,7 @@ async def _handle_start_from_preset(input: dict, context: ToolContext) -> str:
         "drive_interface": preset.drive_interface,
         "root_dev": preset.root_dev,
         "qemu_extra_args": preset.qemu_extra_args,
+        "extra_drives": preset.extra_drives or None,
     }
 
     result = await _handle_start_emulation(start_input, context)

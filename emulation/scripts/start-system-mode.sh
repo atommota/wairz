@@ -323,6 +323,23 @@ else
     echo "DTB: none"
 fi
 
+# Extra drives (WAIRZ_EXTRA_DRIVES = comma-separated container image paths).
+# Attached after the root disk on the same bus, so the guest sees them as the
+# next device letters (virtio: vdb,vdc…; ide: sdb,sdc…). Used for devices whose
+# config/data lives on a separate flash/MMC partition carved from the raw image.
+EXTRA_DRIVE_ARGS=""
+if [ -n "$WAIRZ_EXTRA_DRIVES" ]; then
+    IFS=',' read -ra _XDRIVES <<< "$WAIRZ_EXTRA_DRIVES"
+    for _xd in "${_XDRIVES[@]}"; do
+        if [ -f "$_xd" ]; then
+            EXTRA_DRIVE_ARGS="$EXTRA_DRIVE_ARGS -drive file=$_xd,format=raw${DRIVE_IF}"
+            echo "Extra drive: $_xd ($(wc -c < "$_xd") bytes, if=${DRIVE_IF:-ide})"
+        else
+            echo "WARNING: extra drive not found, skipping: $_xd"
+        fi
+    done
+fi
+
 # Build kernel append string
 APPEND_ARGS="root=$ROOT_DEV rw console=$CONSOLE panic=0"
 if [ -n "$INIT_PATH" ]; then
@@ -363,6 +380,7 @@ exec "$QEMU_BIN" \
     $INITRD_ARGS \
     $DTB_ARGS \
     -drive "file=$ROOTFS_IMG,format=raw${DRIVE_IF}" \
+    $EXTRA_DRIVE_ARGS \
     -append "$APPEND_ARGS" \
     $NET_ARGS \
     $QEMU_EXTRA_ARGS

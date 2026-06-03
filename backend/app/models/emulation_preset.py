@@ -46,6 +46,9 @@ class EmulationPreset(Base):
     drive_interface: Mapped[str | None] = mapped_column(String(20))
     root_dev: Mapped[str | None] = mapped_column(String(50))
     qemu_extra_args: Mapped[str | None] = mapped_column(Text)
+    # Extra disk/partition images to attach + optionally mount, as a list of
+    # {"path", "mount"?, "fstype"?} dicts.
+    extra_drives: Mapped[list | None] = mapped_column(JSONB, server_default="'[]'")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

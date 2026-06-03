@@ -5,6 +5,7 @@ Uses the Docker SDK to spawn isolated containers running QEMU in user-mode
 """
 
 import asyncio
+import base64
 import io
 import logging
 import os
@@ -322,6 +323,7 @@ class EmulationService:
         drive_interface: str | None = None,
         root_dev: str | None = None,
         qemu_extra_args: str | None = None,
+        extra_drives: list[dict] | None = None,
     ) -> EmulationSession:
         """Start a new emulation session.
 
@@ -357,6 +359,14 @@ class EmulationService:
             root_dev: Root device for ``root=`` (e.g. "/dev/vda", "/dev/sda").
             qemu_extra_args: Raw extra arguments appended to the QEMU command
                 line — escape hatch for anything not modeled above.
+            extra_drives: Additional disk/partition images to attach as extra
+                virtio/IDE drives (system mode). Each is a dict
+                ``{"path": <firmware-relative image>, "mount": <guest dir>?,
+                "fstype": <fs>?}``. Drives are attached after the root disk
+                (root=…a, extras=…b, …c) and, when ``mount`` is given, mounted
+                by the init wrapper before firmware init. Use for devices whose
+                config/data lives on a separate flash/MMC partition not in the
+                root image (e.g. carve MBR p3 → mount at /data).
         """
         if mode not in ("user", "system"):
             raise ValueError("mode must be 'user' or 'system'")
@@ -370,6 +380,22 @@ class EmulationService:
         # Validate binary_path against extracted root
         if binary_path:
             validate_path(firmware.extracted_path, binary_path)
+
+        # Validate extra_drives: each must name a firmware-relative image path
+        # that resolves inside the sandbox. A "mount" target must be absolute.
+        if extra_drives:
+            if mode != "system":
+                raise ValueError("extra_drives is only supported in system mode")
+            for d in extra_drives:
+                path = (d or {}).get("path")
+                if not path:
+                    raise ValueError("each extra_drives entry needs a 'path'")
+                validate_path(firmware.extracted_path, path)
+                mount = d.get("mount")
+                if mount and not str(mount).startswith("/"):
+                    raise ValueError(
+                        f"extra_drives mount must be an absolute guest path: {mount!r}"
+                    )
 
         # Check concurrent session limit
         active = await self._count_active_sessions(firmware.project_id)
@@ -421,6 +447,7 @@ class EmulationService:
                 drive_interface=drive_interface,
                 root_dev=root_dev,
                 qemu_extra_args=qemu_extra_args,
+                extra_drives=extra_drives,
             )
             session.container_id = container_id
             session.status = "running"
@@ -912,6 +939,7 @@ echo "Symlink repair: pass1=$PASS1 pass2=$PASS2 pass3=$PASS3"
         pre_init_script: str | None = None,
         stub_profile: str = "none",
         shell_path: str = "/bin/sh",
+        extra_mounts: list[dict] | None = None,
     ) -> str:
         """Generate a wairz init wrapper script for system-mode emulation.
 
@@ -941,6 +969,60 @@ done
 # Fallback to shell
 echo "[wairz] No init found, dropping to shell"
 exec /bin/sh"""
+
+        # Mount any extra drives (carved partitions attached after the root
+        # disk) before the pre-init script and firmware init run, so the
+        # firmware finds its data/config partition where it expects it.
+        extra_mount_block = ""
+        if extra_mounts:
+            mount_lines = []
+            for m in extra_mounts:
+                dev = m["device"]
+                mp = m["mountpoint"]
+                fst = m.get("fstype")
+                t = f"-t {fst} " if fst else ""
+                # Try the requested/auto fstype, then a bare mount as fallback.
+                mount_lines.append(
+                    f'mkdir -p {mp} 2>/dev/null\n'
+                    f'if mount {t}{dev} {mp} 2>/dev/null || mount {dev} {mp} 2>/dev/null; then\n'
+                    f'    echo "[wairz] Mounted {dev} -> {mp}"\n'
+                    f'else\n'
+                    f'    echo "[wairz] WARNING: failed to mount {dev} -> {mp}"\n'
+                    f'fi'
+                )
+            extra_mount_block = (
+                "\n# --- Extra partitions attached from the raw image ---\n"
+                + "\n".join(mount_lines)
+            )
+
+        # Guarantee an interactive shell on the console QEMU actually wired up.
+        # Firmware inittab usually spawns getty only on ttyS0 (the physical
+        # UART). On QEMU -M virt the console is ttyAMA0, so that getty targets a
+        # device that doesn't exist and no shell appears — run_command_in_emulation
+        # then sees no prompt and returns empty output (feedback #7). Detect the
+        # active console and ensure a shell respawns on it regardless of the tty
+        # the firmware's inittab names. A bare-id respawn entry ("::respawn:")
+        # attaches to the controlling console (/dev/console), which is whatever
+        # serial QEMU exposed.
+        console_shell_block = r"""
+# --- Ensure a shell on the active serial console (feedback #7) ---
+ACTIVE_TTY=$(cat /sys/class/tty/console/active 2>/dev/null | awk '{print $NF}')
+[ -z "$ACTIVE_TTY" ] && ACTIVE_TTY=$(awk 'NR==1{print $1}' /proc/consoles 2>/dev/null)
+[ -z "$ACTIVE_TTY" ] && ACTIVE_TTY=$(sed -n 's/.*console=\([^ ,]*\).*/\1/p' /proc/cmdline 2>/dev/null | tail -1)
+for d in /etc /etc_ro; do
+    [ -f "$d/inittab" ] || continue
+    if [ -n "$ACTIVE_TTY" ]; then
+        # Repoint any UART getty/shell respawn line at the live console as a shell.
+        sed -i "s#^tty[A-Za-z0-9]*::\(respawn\|askfirst\):.*#${ACTIVE_TTY}::respawn:/bin/sh#" "$d/inittab" 2>/dev/null
+    fi
+    # Fallback: if no console shell is defined at all, bind one to /dev/console.
+    if ! grep -q "::respawn:.*sh" "$d/inittab" 2>/dev/null \
+       && ! grep -q "::askfirst:.*sh" "$d/inittab" 2>/dev/null; then
+        echo "::respawn:-/bin/sh" >> "$d/inittab"
+    fi
+done
+echo "[wairz] Ensured shell on console ${ACTIVE_TTY:-/dev/console}"
+"""
 
         pre_init_block = ""
         if pre_init_script:
@@ -1008,6 +1090,7 @@ mount -t sysfs sysfs /sys 2>/dev/null
 mkdir -p /tmp /var/run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
+{console_shell_block}
 
 # Configure networking (QEMU user-mode networking uses 10.0.2.0/24)
 # Wait briefly for NIC driver to initialize
@@ -1025,6 +1108,7 @@ fi
 if command -v ifconfig >/dev/null 2>&1; then
     echo "[wairz] Network: $(ifconfig eth0 2>/dev/null | grep 'inet ' || echo 'not configured')"
 fi
+{extra_mount_block}
 {pre_init_block}
 
 # Enable core dumps for crash analysis
@@ -1060,6 +1144,7 @@ echo "[wairz] Starting firmware init..."
         init_path: str | None = None,
         pre_init_script: str | None = None,
         stub_profile: str = "none",
+        extra_mounts: list[dict] | None = None,
     ) -> str:
         """Inject the wairz init wrapper into the firmware rootfs.
 
@@ -1098,6 +1183,7 @@ echo "[wairz] Starting firmware init..."
             pre_init_script,
             stub_profile=stub_profile,
             shell_path=shell_path,
+            extra_mounts=extra_mounts,
         )
 
         # Write scripts into the container using put_archive (avoids heredoc/escaping issues)
@@ -1136,6 +1222,7 @@ echo "[wairz] Starting firmware init..."
         drive_interface: str | None = None,
         root_dev: str | None = None,
         qemu_extra_args: str | None = None,
+        extra_drives: list[dict] | None = None,
     ) -> str:
         """Spawn a Docker container for this emulation session."""
         client = self._get_docker_client()
@@ -1167,10 +1254,27 @@ echo "[wairz] Starting firmware init..."
         kernel_backend_path = None
         initrd_backend_path = None
         if session.mode == "system":
+            # An ARMv7/hard-float (armhf) userland can't run on the default
+            # ARM board (versatilepb, ARMv5/v6) — it SIGILLs init immediately.
+            # The arch string was already normalised to "arm" (the armhf signal
+            # is lost), so recover the ISA from the rootfs ELFs and, when it's
+            # ARMv7-hf, steer kernel + board selection to virt (feedback #5).
+            arm_isa = (
+                self._detect_arm_isa(extracted_path)
+                if (session.architecture or "").lower() in ("arm", "armhf", "armel")
+                else None
+            )
+            prefer_machine = "virt" if arm_isa == "armv7-hf" else None
+            if prefer_machine:
+                logger.info(
+                    "Detected ARMv7/hard-float userland — steering to -M virt "
+                    "(cortex-a15, virtio) and a virt-capable kernel."
+                )
             kernel_backend_path = self._find_kernel(
                 session.architecture,
                 kernel_name=kernel_name,
                 firmware_kernel_path=firmware_kernel_path,
+                prefer_machine=prefer_machine,
             )
             if initrd_path:
                 # Agent-supplied initrd: a path inside the firmware filesystem
@@ -1334,6 +1438,83 @@ echo "[wairz] Starting firmware init..."
                 dtb_container_path = CONTAINER_DTB_PATH
                 logger.info("Copied dtb to container: %s", dtb_backend_path)
 
+            # Resolve effective system-mode board settings. Precedence:
+            #   explicit agent param > kernel sidecar hint > ISA-derived default
+            #   > start-system-mode.sh per-arch default (left None → script picks).
+            # The chosen kernel's sidecar declares the QEMU machine it was built
+            # for; an ARMv7-hf userland additionally forces the virt board so a
+            # VFP binary doesn't SIGILL on versatilepb (feedback #5).
+            from app.services.kernel_service import KernelService
+            try:
+                kmeta = KernelService().get_kernel_meta(
+                    os.path.basename(kernel_backend_path)
+                )
+            except Exception:
+                kmeta = {}
+            isa_defaults: dict = {}
+            if arm_isa == "armv7-hf":
+                isa_defaults = {
+                    "machine": "virt", "cpu": "cortex-a15",
+                    "drive_interface": "virtio", "root_dev": "/dev/vda",
+                    "mem": 512,
+                }
+
+            def _board(key, explicit):
+                if explicit is not None:
+                    return explicit
+                if kmeta.get(key) is not None:
+                    return kmeta.get(key)
+                return isa_defaults.get(key)
+
+            eff_machine = _board("machine", machine)
+            eff_drive_if = _board("drive_interface", drive_interface)
+            eff_root_dev = _board("root_dev", root_dev)
+            eff_mem = _board("mem", mem)
+            effective_cpu = (
+                cpu or kmeta.get("cpu") or isa_defaults.get("cpu")
+                or self._default_system_cpu(session.architecture, kernel_backend_path)
+            )
+            if eff_machine and eff_machine != machine:
+                logger.info(
+                    "System-mode board default: -M %s (cpu=%s, drive_if=%s, "
+                    "root=%s, mem=%s)",
+                    eff_machine, effective_cpu, eff_drive_if, eff_root_dev,
+                    eff_mem,
+                )
+
+            # Copy any extra drive images into the container and work out the
+            # guest device each will appear as. They're attached after the root
+            # disk (which is the first -drive), so they enumerate from the
+            # second device letter on the same bus (virtio → vdb…, ide → sdb…).
+            extra_drive_container_paths: list[str] = []
+            extra_mounts: list[dict] = []
+            if extra_drives:
+                dev_prefix = self._disk_dev_prefix(
+                    session.architecture, eff_machine, eff_drive_if
+                )
+                for idx, d in enumerate(extra_drives):
+                    backend_img = validate_path(extracted_path, d["path"])
+                    if not os.path.isfile(backend_img):
+                        raise ValueError(
+                            f"extra drive image not found at firmware path "
+                            f"'{d['path']}' (resolved to {backend_img})"
+                        )
+                    container_img = f"/tmp/extra_drive{idx}.img"
+                    self._copy_file_to_container(container, backend_img, container_img)
+                    extra_drive_container_paths.append(container_img)
+                    guest_dev = f"{dev_prefix}{chr(ord('b') + idx)}"
+                    logger.info(
+                        "Extra drive %s -> guest %s%s",
+                        backend_img, guest_dev,
+                        f" (mount {d['mount']})" if d.get("mount") else "",
+                    )
+                    if d.get("mount"):
+                        extra_mounts.append({
+                            "device": guest_dev,
+                            "mountpoint": d["mount"],
+                            "fstype": d.get("fstype"),
+                        })
+
             # Inject init wrapper into the firmware rootfs. The wrapper
             # auto-mounts proc/sysfs, configures networking, sets LD_PRELOAD
             # based on stub_profile, sources the optional pre-init script,
@@ -1344,6 +1525,7 @@ echo "[wairz] Starting firmware init..."
                 init_path=init_path,
                 pre_init_script=pre_init_script,
                 stub_profile=stub_profile,
+                extra_mounts=extra_mounts,
             )
 
             pf_str = ""
@@ -1362,26 +1544,25 @@ echo "[wairz] Starting firmware init..."
             ]
 
             # Agent-supplied QEMU/boot overrides are passed to the launch script
-            # as WAIRZ_* environment variables. An auto-selected -cpu default is
-            # applied when the agent didn't specify one (e.g. arm1176 for the
-            # dhruvvyas90-style RPi kernels, which fault on versatilepb's default
-            # arm926 before console init); the agent can always override it.
-            effective_cpu = cpu or self._default_system_cpu(
-                session.architecture, kernel_backend_path
-            )
+            # as WAIRZ_* environment variables. The effective board settings
+            # resolved above (explicit param > kernel sidecar > ISA default)
+            # fill in any knob the agent left unset; an unset WAIRZ_* var keeps
+            # start-system-mode.sh's per-arch default.
             env = self._build_system_env(
                 cpu=effective_cpu,
-                machine=machine,
+                machine=eff_machine,
                 nic_model=nic_model,
-                mem=mem,
+                mem=eff_mem,
                 smp=smp,
                 kernel_append=kernel_append,
-                drive_interface=drive_interface,
-                root_dev=root_dev,
+                drive_interface=eff_drive_if,
+                root_dev=eff_root_dev,
                 qemu_extra_args=qemu_extra_args,
             )
             if dtb_container_path:
                 env["WAIRZ_DTB"] = dtb_container_path
+            if extra_drive_container_paths:
+                env["WAIRZ_EXTRA_DRIVES"] = ",".join(extra_drive_container_paths)
             container.exec_run(cmd, detach=True, environment=env or None)
 
             # Health check: wait briefly to catch early QEMU failures
@@ -1445,6 +1626,101 @@ echo "[wairz] Starting firmware init..."
         if any(marker in name for marker in rpi_markers):
             return "arm1176"
         return None
+
+    # ARM ELF e_flags bit set by hard-float (armhf / ARMv7+VFP) toolchains.
+    _EF_ARM_ABI_FLOAT_HARD = 0x400
+    # Representative rootfs binaries to sniff for the userland ISA, in order.
+    _ISA_PROBE_BINARIES = (
+        "bin/busybox", "bin/sh", "bin/ash", "sbin/init",
+        "usr/bin/busybox", "lib/libc.so.0", "lib/libc.so.6",
+    )
+
+    @classmethod
+    def _detect_arm_isa(cls, extracted_path: str | None) -> str | None:
+        """Classify the ARM userland ISA from a representative rootfs ELF.
+
+        Returns ``"armv7-hf"`` when the binaries are ARMv7/hard-float (VFP) —
+        which need an ARMv7-class board (``-M virt`` + cortex-a15). The default
+        ARM board (versatilepb) is an ARMv5/v6 machine whose CPU SIGILLs a VFP
+        userland the instant init runs, panicking the kernel with no hint
+        (feedback #5). Returns ``None`` when the userland is not ARMv7-hf (or
+        is unreadable), leaving the legacy versatilepb default untouched.
+        Best-effort and never raises.
+        """
+        if not extracted_path or not os.path.isdir(extracted_path):
+            return None
+        try:
+            from elftools.elf.elffile import ELFFile
+        except Exception:
+            return None
+
+        candidates = [os.path.join(extracted_path, p) for p in cls._ISA_PROBE_BINARIES]
+        for d in ("bin", "sbin", "usr/bin"):
+            dpath = os.path.join(extracted_path, d)
+            if os.path.isdir(dpath):
+                try:
+                    candidates.extend(
+                        os.path.join(dpath, n) for n in sorted(os.listdir(dpath))[:40]
+                    )
+                except OSError:
+                    pass
+
+        for path in candidates:
+            try:
+                real = os.path.realpath(path)
+                if not os.path.isfile(real):
+                    continue
+                with open(real, "rb") as f:
+                    if f.read(4) != b"\x7fELF":
+                        continue
+                    f.seek(0)
+                    elf = ELFFile(f)
+                    if elf["e_machine"] != "EM_ARM":
+                        return None  # not an ARM userland — nothing to steer
+                    flags = elf["e_flags"] or 0
+                    if flags & cls._EF_ARM_ABI_FLOAT_HARD:
+                        return "armv7-hf"
+                    # Secondary signal: ARMv7-A via build attributes
+                    # (Tag_CPU_arch == 10). Avoids matching M-profile values.
+                    try:
+                        sec = elf.get_section_by_name(".ARM.attributes")
+                        if sec is not None:
+                            for sub in sec.iter_subsections():
+                                for attr in sub.iter_attributes():
+                                    if (getattr(attr, "tag", None) == "TAG_CPU_ARCH"
+                                            and attr.value == 10):
+                                        return "armv7-hf"
+                    except Exception:
+                        pass
+                    return None  # readable ARM ELF, soft-float / pre-v7
+            except Exception:
+                continue
+        return None
+
+    # Per-arch default machine (mirrors the case statement in
+    # start-system-mode.sh) — used to predict the guest disk device prefix.
+    _ARCH_DEFAULT_MACHINE = {
+        "arm": "versatilepb", "armhf": "versatilepb", "armel": "versatilepb",
+        "aarch64": "virt", "arm64": "virt",
+        "mips": "malta", "mipsbe": "malta", "mipsel": "malta", "mipsle": "malta",
+        "x86": "pc", "i386": "pc", "i686": "pc", "x86_64": "pc", "amd64": "pc",
+    }
+
+    @classmethod
+    def _disk_dev_prefix(
+        cls, arch: str | None, machine: str | None, drive_interface: str | None
+    ) -> str:
+        """Predict the guest block-device prefix ('/dev/vd' or '/dev/sd').
+
+        Mirrors how start-system-mode.sh selects the drive interface so the
+        harness can name the extra drives (root=…a, extras=…b,…) for mounting.
+        virtio disks enumerate as vd[a-z]; IDE/SCSI/SD as sd[a-z].
+        """
+        di = (drive_interface or "").lower()
+        if di:
+            return "/dev/vd" if di == "virtio" else "/dev/sd"
+        eff_machine = machine or cls._ARCH_DEFAULT_MACHINE.get(arch or "", "")
+        return "/dev/vd" if eff_machine == "virt" else "/dev/sd"
 
     async def _await_system_startup(
         self,
@@ -1593,6 +1869,7 @@ echo "[wairz] Starting firmware init..."
         arch: str | None,
         kernel_name: str | None = None,
         firmware_kernel_path: str | None = None,
+        prefer_machine: str | None = None,
     ) -> str:
         """Find a kernel for system-mode emulation.
 
@@ -1633,9 +1910,12 @@ echo "[wairz] Starting firmware init..."
                     firmware_kernel_path, reason,
                 )
 
-        # 3) Pre-built kernel from the kernel management directory
+        # 3) Pre-built kernel from the kernel management directory. An ARMv7/
+        # hard-float userland is steered to a virt-capable kernel via
+        # prefer_machine so it doesn't land on a versatilepb-only kernel it
+        # can't boot (feedback #5).
         svc = KernelService()
-        match = svc.find_kernel_for_arch(arch or "arm")
+        match = svc.find_kernel_for_arch(arch or "arm", prefer_machine=prefer_machine)
         if match:
             return os.path.join(kernel_dir, match["name"])
 
@@ -1808,6 +2088,121 @@ echo "[wairz] Starting firmware init..."
 
         except Exception as exc:
             raise ValueError(f"Command execution failed: {exc}")
+
+    # Max payload for serial injection. Base64-over-serial is one round-trip
+    # per chunk, so multi-MB files would be painfully slow; for those, attach
+    # the data as an extra_drive instead.
+    _MAX_INJECT_BYTES = 4 * 1024 * 1024
+
+    async def inject_file(
+        self,
+        session_id: UUID,
+        guest_path: str,
+        data: bytes,
+        mode: str | None = None,
+        chunk_size: int = 512,
+    ) -> dict:
+        """Write a file into an emulation session, reliably.
+
+        Replaces hand-pasting base64 over the serial console (flaky for binary
+        data, unreliable exit codes). For system mode, the payload is
+        base64-encoded and streamed in chunks over the serial console, decoded
+        guest-side, and the resulting size is verified against the input. For
+        user mode, the file is written straight into the chroot rootfs.
+
+        Returns {bytes, guest_size, verified, mode}.
+        """
+        if not guest_path.startswith("/"):
+            raise ValueError("guest_path must be absolute")
+        if len(data) > self._MAX_INJECT_BYTES:
+            raise ValueError(
+                f"file too large for injection ({len(data)} bytes > "
+                f"{self._MAX_INJECT_BYTES}); attach it as an extra_drive instead"
+            )
+
+        result = await self.db.execute(
+            select(EmulationSession).where(EmulationSession.id == session_id)
+        )
+        session = result.scalar_one_or_none()
+        if not session:
+            raise ValueError("Session not found")
+        if session.status != "running":
+            raise ValueError(f"Session is not running (status: {session.status})")
+        if not session.container_id:
+            raise ValueError("No container associated with this session")
+
+        # User mode: write directly into the chroot rootfs in the container —
+        # subsequent run_command_in_emulation calls (chroot /firmware) see it.
+        if session.mode == "user":
+            client = self._get_docker_client()
+            container = client.containers.get(session.container_id)
+            target = "/firmware" + guest_path
+            container.exec_run(["mkdir", "-p", os.path.dirname(target)])
+            self._put_bytes_in_container(
+                container, target, data, mode=int(mode, 8) if mode else 0o644
+            )
+            return {
+                "bytes": len(data), "guest_size": str(len(data)),
+                "verified": True, "mode": "user",
+            }
+
+        # System mode: stream base64 over the serial console in chunks.
+        b64 = base64.b64encode(data).decode("ascii")
+        tmp = "/tmp/.wairz_inject.b64"
+        qpath = shlex.quote(guest_path)
+
+        reset = await self.exec_command(session_id, f"rm -f {tmp}", timeout=20)
+        if reset["timed_out"]:
+            raise ValueError(
+                "serial console did not respond — is the guest booted to a shell?"
+            )
+        for i in range(0, len(b64), chunk_size):
+            chunk = b64[i:i + chunk_size]  # base64 alphabet is shell-quote-safe
+            r = await self.exec_command(
+                session_id, f"printf '%s' '{chunk}' >> {tmp}", timeout=30
+            )
+            if r["timed_out"]:
+                raise ValueError(
+                    f"serial timeout while streaming chunk at offset {i} "
+                    f"of {len(b64)}"
+                )
+        # Decode into place and clean up the staging file.
+        decode_cmd = (
+            f"mkdir -p $(dirname {qpath}) 2>/dev/null; "
+            f"base64 -d {tmp} > {qpath} && rm -f {tmp}"
+        )
+        await self.exec_command(session_id, decode_cmd, timeout=30)
+        if mode:
+            await self.exec_command(session_id, f"chmod {shlex.quote(mode)} {qpath}", timeout=15)
+
+        # Verify the written size matches the payload.
+        chk = await self.exec_command(session_id, f"wc -c < {qpath}", timeout=20)
+        guest_size = chk["stdout"].strip().split()[-1] if chk["stdout"].strip() else ""
+        return {
+            "bytes": len(data),
+            "guest_size": guest_size,
+            "verified": guest_size == str(len(data)),
+            "mode": "system",
+        }
+
+    @staticmethod
+    def _put_bytes_in_container(
+        container: "docker.models.containers.Container",
+        path: str,
+        data: bytes,
+        mode: int = 0o644,
+    ) -> None:
+        """Write raw bytes to a file in a container via put_archive."""
+        directory = os.path.dirname(path) or "/"
+        name = os.path.basename(path)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+        container.put_archive(directory, buf.getvalue())
 
     async def send_ctrl_c(self, session_id: UUID) -> dict:
         """Send Ctrl-C to a running system-mode emulation session.
@@ -2008,6 +2403,7 @@ echo "[wairz] Starting firmware init..."
         drive_interface: str | None = None,
         root_dev: str | None = None,
         qemu_extra_args: str | None = None,
+        extra_drives: list[dict] | None = None,
     ) -> EmulationPreset:
         """Create a new emulation preset for a project."""
         preset = EmulationPreset(
@@ -2034,6 +2430,7 @@ echo "[wairz] Starting firmware init..."
             drive_interface=drive_interface,
             root_dev=root_dev,
             qemu_extra_args=qemu_extra_args,
+            extra_drives=extra_drives or [],
         )
         self.db.add(preset)
         await self.db.flush()

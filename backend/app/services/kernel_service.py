@@ -199,6 +199,9 @@ class KernelService:
             "uploaded_at": uploaded_at,
             "has_initrd": has_initrd,
             "has_dtb": has_dtb,
+            # Optional QEMU board this kernel targets (e.g. "virt",
+            # "versatilepb"); used to steer board selection (feedback #5).
+            "machine": (sidecar or {}).get("machine"),
         }
 
     def list_kernels(self, architecture: str | None = None) -> list[dict]:
@@ -286,10 +289,50 @@ class KernelService:
         if os.path.isfile(sidecar_path):
             os.remove(sidecar_path)
 
-    def find_kernel_for_arch(self, architecture: str) -> dict | None:
-        """Return the first kernel matching the given architecture, or None."""
+    def find_kernel_for_arch(
+        self, architecture: str, prefer_machine: str | None = None
+    ) -> dict | None:
+        """Return a kernel matching the given architecture, or None.
+
+        When ``prefer_machine`` is set (e.g. "virt" for an ARMv7/hard-float
+        userland that can't run on the ARMv5/v6 versatilepb board), a kernel
+        whose sidecar declares that machine wins over the alphabetical first
+        match. This is how an armhf image is steered to the armvirt kernel
+        instead of a Raspberry-Pi/versatile one (feedback #5).
+        """
         kernels = self.list_kernels(architecture=architecture)
-        return kernels[0] if kernels else None
+        if not kernels:
+            return None
+        if prefer_machine:
+            for k in kernels:
+                if (k.get("machine") or "").lower() == prefer_machine.lower():
+                    return k
+        return kernels[0]
+
+    def get_kernel_meta(self, name: str) -> dict:
+        """Return the board/boot hints a kernel's sidecar declares, or {}.
+
+        Recognised keys: ``machine``, ``cpu``, ``drive_interface``,
+        ``root_dev``, ``mem`` (and ``console``). These let a kernel describe
+        the QEMU machine it was built for so the emulation service can pick
+        matching board defaults without the agent specifying them. Unknown
+        kernels (e.g. firmware-extracted) simply return {}.
+        """
+        try:
+            _validate_kernel_name(name)
+        except ValueError:
+            return {}
+        sidecar = self._read_sidecar(name)
+        if not sidecar:
+            return {}
+        meta: dict = {}
+        for key in ("machine", "cpu", "drive_interface", "root_dev", "console"):
+            val = sidecar.get(key)
+            if val:
+                meta[key] = val
+        if isinstance(sidecar.get("mem"), int):
+            meta["mem"] = sidecar["mem"]
+        return meta
 
     async def upload_initrd(
         self,
