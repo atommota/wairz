@@ -12,6 +12,7 @@ from app.ai.tool_registry import ToolContext, ToolRegistry
 from app.config import get_settings
 from app.models.firmware import Firmware
 from app.models.fuzzing import FuzzingCampaign, FuzzingCrash
+from app.services.binary_patch_service import BinaryPatchError, BinaryPatchService
 from app.services.fuzzing_service import FuzzingService
 from app.services.harness_build_service import (
     HarnessBuildError,
@@ -246,6 +247,65 @@ def register_fuzzing_tools(registry: ToolRegistry) -> None:
             "required": ["lib_path", "harness_source", "name"],
         },
         handler=_handle_build_harness,
+    )
+
+    registry.register(
+        name="patch_function_return",
+        description=(
+            "Force a function in a firmware binary (or .so) to immediately "
+            "return a constant, by overwriting its entry with an arch-specific "
+            "'return <value>' stub. Produces a patched copy in /_carved/patched/.\n"
+            "\n"
+            "Primary use — AUTH BYPASS for daemon fuzzing: web daemons like httpd "
+            "(CivetWeb) embed the auth check in the binary, so an LD_PRELOAD shim "
+            "can't interpose it. Patch the auth function (e.g. CheckAuth, "
+            "mg_check_digest_access_authentication) to return 1 (authenticated), "
+            "then fuzz the patched daemon with start_fuzzing_campaign("
+            "harness_binary=/_carved/patched/<name>, desock=true) to reach "
+            "post-auth request handlers. Also neutralises license/CRC/crypto "
+            "gates.\n"
+            "\n"
+            "Identify the function and its return convention by decompiling first "
+            "(decompile_function / list_functions). Supports ARM (arm+thumb), "
+            "AArch64, MIPS/MIPSel. The function may be a symbol name or a 0x… "
+            "address (for stripped/local targets)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "binary_path": {
+                    "type": "string",
+                    "description": "Firmware path to the binary/.so to patch (e.g. /sbin/httpd).",
+                },
+                "function": {
+                    "type": "string",
+                    "description": (
+                        "Function symbol name (e.g. CheckAuth) or a hex address "
+                        "(e.g. 0x132e8) to force-return."
+                    ),
+                },
+                "return_value": {
+                    "type": "integer",
+                    "description": "Value the function should return (default 1). 0..65535.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Output filename under /_carved/patched/ (default "
+                        "<binary>.patched)."
+                    ),
+                },
+                "thumb": {
+                    "type": "boolean",
+                    "description": (
+                        "ARM only: force Thumb (true) or ARM (false) stub. Default: "
+                        "auto from the symbol's Thumb bit."
+                    ),
+                },
+            },
+            "required": ["binary_path", "function"],
+        },
+        handler=_handle_patch_function_return,
     )
 
     registry.register(
@@ -915,6 +975,47 @@ async def _handle_build_harness(input: dict, context: ToolContext) -> str:
     lines.append("")
     lines.append(f"--- build log (tail) ---\n{log_tail}")
     return "\n".join(lines)
+
+
+async def _handle_patch_function_return(input: dict, context: ToolContext) -> str:
+    """Patch a firmware function to return a constant (auth bypass etc.)."""
+    binary_path = input.get("binary_path", "")
+    function = input.get("function", "")
+    if not binary_path or not function:
+        return "Error: binary_path and function are required."
+    return_value = input.get("return_value", 1)
+    name = input.get("name")
+    thumb = input.get("thumb")
+
+    svc = BinaryPatchService(context.db)
+    try:
+        r = await svc.patch_function_return(
+            project_id=context.project_id,
+            firmware_id=context.firmware_id,
+            binary_path=binary_path,
+            function=function,
+            return_value=return_value,
+            name=name,
+            thumb=thumb,
+        )
+    except BinaryPatchError as exc:
+        return f"Error: {exc}"
+    except Exception as exc:
+        return f"Error patching binary: {exc}"
+
+    return (
+        f"Patched binary: {r.patched_virtual_path}\n"
+        f"  {r.detail}\n"
+        f"  Stub bytes: {r.stub_hex}\n"
+        "\n"
+        "Fuzz the patched daemon (auth now bypassed) with:\n"
+        f"  start_fuzzing_campaign(binary_path=\"{binary_path}\", "
+        f"harness_binary=\"{r.patched_virtual_path}\", desock=true)\n"
+        "Add environment={\"AFL_INST_LIBS\": \"1\"} if the request handlers live "
+        "in a shared library. If coverage stays flat, the daemon likely forks/"
+        "threads per connection (defeats desock) — consider harnessing the "
+        "specific handler function with build_fuzz_harness instead."
+    )
 
 
 async def _handle_check_status(input: dict, context: ToolContext) -> str:
