@@ -184,6 +184,31 @@ class FuzzingService:
 
         container.put_archive("/opt/fuzzing/input", tar_stream)
 
+    @staticmethod
+    def _resolve_carved_path(firmware: Firmware, virtual_path: str) -> str | None:
+        """Map a /_carved/... virtual path to its real path under the carved dir.
+
+        Built harnesses live in the project's carved/ dir (firmware blob's
+        directory). Used to locate a compiled harness ELF to copy into the
+        fuzzing container. Stays sandboxed to the carved dir.
+        """
+        if not firmware.storage_path:
+            return None
+        carved_dir = os.path.realpath(
+            os.path.join(os.path.dirname(firmware.storage_path), "carved")
+        )
+        rel = virtual_path
+        for prefix in ("/_carved/", "_carved/"):
+            if rel.startswith(prefix):
+                rel = rel[len(prefix):]
+                break
+        else:
+            rel = rel.lstrip("/")
+        full = os.path.realpath(os.path.join(carved_dir, rel))
+        if full != carved_dir and not full.startswith(carved_dir + os.sep):
+            return None
+        return full
+
     def _resolve_host_path(self, container_path: str) -> str | None:
         """Resolve a container path to a host path for Docker volume mounts."""
         real_path = os.path.realpath(container_path)
@@ -504,6 +529,27 @@ class FuzzingService:
                 container.exec_run(["chmod", "+x", "/opt/fuzzing/harness.sh"])
                 harness_target = "/opt/fuzzing/harness.sh"
 
+            # A compiled harness ELF (built by build_fuzz_harness, living in the
+            # project's carved dir) takes precedence: copy it into the container
+            # and run it directly under -Q. It links the firmware .so and is
+            # resolved against /firmware via QEMU_LD_PREFIX. (Track B / #2.)
+            harness_binary = config.get("harness_binary")
+            harness_elf_target = None
+            harness_real = None
+            if harness_binary:
+                harness_real = self._resolve_carved_path(firmware, harness_binary)
+                if not harness_real or not os.path.isfile(harness_real):
+                    raise ValueError(
+                        f"harness binary not found: {harness_binary} "
+                        f"(resolved to {harness_real})"
+                    )
+                with open(harness_real, "rb") as f:
+                    self._write_file_to_container(
+                        container, "/opt/fuzzing/harness_elf", f.read()
+                    )
+                container.exec_run(["chmod", "+x", "/opt/fuzzing/harness_elf"])
+                harness_elf_target = "/opt/fuzzing/harness_elf"
+
             # Build AFL++ command
             timeout_ms = config.get("timeout_per_exec", 1000)
             binary_in_firmware = campaign.binary_path.lstrip("/")
@@ -513,15 +559,15 @@ class FuzzingService:
 
             # Auto-enable AFL_INST_LIBS for lib-backed targets. In QEMU mode AFL
             # only instruments the main object's code range, so a thin wrapper
-            # whose real logic is in a .so (e.g. xmllint → libxml2) shows
-            # near-zero coverage. Detect that case and turn it on unless the
-            # caller set it explicitly (feedback #3).
+            # whose real logic is in a .so (e.g. xmllint → libxml2, or a built
+            # harness → the firmware .so) shows near-zero coverage. Detect that
+            # and turn it on unless the caller set it explicitly (feedback #3).
             if "AFL_INST_LIBS" not in extra_env:
                 try:
-                    target_real = validate_path(
+                    probe_real = harness_real or validate_path(
                         firmware.extracted_path, campaign.binary_path
                     )
-                    libinfo = _elf_lib_backed(target_real)
+                    libinfo = _elf_lib_backed(probe_real)
                 except Exception:  # noqa: BLE001
                     libinfo = {"lib_backed": False}
                 if libinfo.get("lib_backed"):
@@ -575,8 +621,11 @@ class FuzzingService:
             if dictionary:
                 afl_cmd += "-x /opt/fuzzing/dictionary.dict "
 
-            # Determine the target: harness script or binary directly
-            if harness_target:
+            # Determine the target: compiled harness ELF, harness script, or
+            # the firmware binary directly.
+            if harness_elf_target:
+                afl_cmd += f"-- {harness_elf_target}"
+            elif harness_target:
                 afl_cmd += f"-- /firmware/bin/sh {harness_target}"
             else:
                 afl_cmd += f"-- /firmware/{binary_in_firmware}"

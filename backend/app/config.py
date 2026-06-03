@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     carving_cpu_limit: float = 1.0
     carving_default_timeout: int = 60
     carving_max_timeout: int = 600
+    # Harness-build sandbox (cross-compiles fuzzing harnesses vs firmware .so).
+    harness_build_image: str = "wairz-harness-build"
+    harness_build_memory_limit_mb: int = 2048
+    harness_build_cpu_limit: float = 2.0
+    harness_build_timeout: int = 180
     uart_bridge_host: str = "host.docker.internal"
     uart_bridge_port: int = 9999
     uart_command_timeout: int = 30

@@ -13,6 +13,10 @@ from app.config import get_settings
 from app.models.firmware import Firmware
 from app.models.fuzzing import FuzzingCampaign, FuzzingCrash
 from app.services.fuzzing_service import FuzzingService
+from app.services.harness_build_service import (
+    HarnessBuildError,
+    HarnessBuildService,
+)
 
 
 def register_fuzzing_tools(registry: ToolRegistry) -> None:
@@ -147,6 +151,18 @@ def register_fuzzing_tools(registry: ToolRegistry) -> None:
                         "that need environment variable setup before execution."
                     ),
                 },
+                "harness_binary": {
+                    "type": "string",
+                    "description": (
+                        "Virtual path (e.g. /_carved/harnesses/<name>) to a compiled "
+                        "harness ELF produced by build_fuzz_harness. When set, AFL++ "
+                        "runs this harness (which links a firmware .so and calls a "
+                        "target function on the fuzz input) instead of a firmware "
+                        "binary. Pair with arguments='@@' for file input. binary_path "
+                        "should still point at the target .so (for the campaign record "
+                        "and AFL_INST_LIBS detection)."
+                    ),
+                },
                 "desock": {
                     "type": "boolean",
                     "description": (
@@ -162,6 +178,74 @@ def register_fuzzing_tools(registry: ToolRegistry) -> None:
             "required": ["binary_path"],
         },
         handler=_handle_start_campaign,
+    )
+
+    registry.register(
+        name="build_fuzz_harness",
+        description=(
+            "Cross-compile a fuzzing harness that links a firmware shared "
+            "library and calls a target function on fuzz input, for the "
+            "firmware's architecture. This is how you reach custom (non-CVE) "
+            "memory-safety bugs in library functions that are otherwise only "
+            "reachable behind a daemon/auth.\n"
+            "\n"
+            "You supply `harness_source`: C that declares the target "
+            "function(s) with their REAL signatures (recover these by "
+            "decompiling the .so — e.g. decompile_function) and defines:\n"
+            "    void harness_one(const unsigned char *data, size_t len);\n"
+            "which maps the fuzz input to the function's arguments and calls "
+            "it. Wairz adds a main() that reads the AFL input (file arg or "
+            "stdin) into (data,len) and invokes harness_one once.\n"
+            "\n"
+            "The harness is built in a network-less sandbox against the "
+            "firmware's own libraries (using an old-glibc cross toolchain so it "
+            "runs under qemu-user with the real .so), and the resulting ELF is "
+            "written to /_carved/harnesses/<name>. Then call start_fuzzing_"
+            "campaign with harness_binary=/_carved/harnesses/<name>, "
+            "binary_path=<the .so>, and arguments='@@'.\n"
+            "\n"
+            "Supported arches: armhf, armel, aarch64, mips, mipsel (auto-"
+            "detected from the firmware; override with `arch`)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "lib_path": {
+                    "type": "string",
+                    "description": (
+                        "Firmware path to the target shared library "
+                        "(e.g. /usr/lib/libsml.so)."
+                    ),
+                },
+                "harness_source": {
+                    "type": "string",
+                    "description": (
+                        "C source defining `void harness_one(const unsigned "
+                        "char *data, size_t len)` and declaring/calling the "
+                        "target function(s). May include headers. Do not define "
+                        "main() (wairz provides it; define WAIRZ_NO_MAIN only if "
+                        "you must supply your own)."
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Output harness name (filename-safe). The ELF lands at "
+                        "/_carved/harnesses/<name>."
+                    ),
+                },
+                "arch": {
+                    "type": "string",
+                    "description": (
+                        "Override the cross-compile arch "
+                        "(armhf|armel|aarch64|mips|mipsel). Default: auto from "
+                        "the firmware."
+                    ),
+                },
+            },
+            "required": ["lib_path", "harness_source", "name"],
+        },
+        handler=_handle_build_harness,
     )
 
     registry.register(
@@ -729,6 +813,8 @@ async def _handle_start_campaign(input: dict, context: ToolContext) -> str:
         config["environment"] = input["environment"]
     if "harness_script" in input:
         config["harness_script"] = input["harness_script"]
+    if "harness_binary" in input:
+        config["harness_binary"] = input["harness_binary"]
     if "desock" in input:
         config["desock"] = input["desock"]
 
@@ -761,6 +847,73 @@ async def _handle_start_campaign(input: dict, context: ToolContext) -> str:
             "analyze any crashes found."
         )
 
+    return "\n".join(lines)
+
+
+async def _handle_build_harness(input: dict, context: ToolContext) -> str:
+    """Cross-compile a fuzzing harness linked against a firmware .so."""
+    lib_path = input.get("lib_path", "")
+    harness_source = input.get("harness_source", "")
+    name = input.get("name", "")
+    arch = input.get("arch")
+    if not lib_path or not harness_source or not name:
+        return "Error: lib_path, harness_source, and name are required."
+
+    svc = HarnessBuildService(context.db)
+    try:
+        result = await svc.build_harness(
+            project_id=context.project_id,
+            firmware_id=context.firmware_id,
+            lib_path=lib_path,
+            harness_source=harness_source,
+            name=name,
+            arch=arch,
+        )
+    except HarnessBuildError as exc:
+        return f"Error: {exc}"
+    except Exception as exc:
+        return f"Error building harness: {exc}"
+
+    if not result.ok:
+        return (
+            f"Harness build FAILED (arch={result.arch}).\n\n"
+            f"--- build log ---\n{result.log[-6000:]}\n\n"
+            "Fix the harness_source (check the target function signature via "
+            "decompile_function) and rebuild."
+        )
+
+    lines = [
+        f"Harness built: {result.elf_virtual_path}",
+        f"  Arch: {result.arch}",
+    ]
+    if result.glibc_max:
+        lines.append(f"  Max glibc symbol version required: {result.glibc_max}")
+        lines.append(
+            "  (must be <= the firmware libc's version, or it won't run under "
+            "qemu-user; armhf base is GLIBC_2.4.)"
+        )
+    lines.append("")
+    lines.append(
+        "Start fuzzing it with:\n"
+        f"  start_fuzzing_campaign(binary_path=\"{lib_path}\", "
+        f"harness_binary=\"{result.elf_virtual_path}\", arguments=\"@@\")\n"
+        "AFL_INST_LIBS is auto-enabled (the harness is lib-backed) so the .so "
+        "code is instrumented. Seed the corpus with realistic, NON-crashing "
+        "inputs (AFL refuses to start if every seed crashes — a sign the "
+        "harness calls the target wrong)."
+    )
+    if result.harness_one_addr and result.elf_type:
+        lines.append("")
+        lines.append(
+            "Optional — persistent mode (much faster) for the no-global-state "
+            "case: add environment={\"AFL_QEMU_PERSISTENT_ADDR\": \""
+            f"{result.harness_one_addr}\", \"AFL_QEMU_PERSISTENT_GPR\": \"1\"}} "
+            f"(harness_one @ {result.harness_one_addr}, ELF type "
+            f"{result.elf_type}; for ET_DYN/PIE add the load base)."
+        )
+    log_tail = result.log[-1500:]
+    lines.append("")
+    lines.append(f"--- build log (tail) ---\n{log_tail}")
     return "\n".join(lines)
 
 
