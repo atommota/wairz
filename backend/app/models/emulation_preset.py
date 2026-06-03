@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,6 +32,20 @@ class EmulationPreset(Base):
     init_path: Mapped[str | None] = mapped_column(String(512))
     pre_init_script: Mapped[str | None] = mapped_column(Text)
     stub_profile: Mapped[str] = mapped_column(String(50), nullable=False, server_default="none")
+    # System-mode QEMU/boot overrides (all optional; None = auto-selected default).
+    # Mirror start_emulation's agent-controllable knobs so a working bring-up
+    # configuration can be saved and replayed.
+    cpu: Mapped[str | None] = mapped_column(String(50))
+    machine: Mapped[str | None] = mapped_column(String(50))
+    nic_model: Mapped[str | None] = mapped_column(String(50))
+    mem: Mapped[int | None] = mapped_column(Integer)
+    smp: Mapped[int | None] = mapped_column(Integer)
+    kernel_append: Mapped[str | None] = mapped_column(Text)
+    initrd_path: Mapped[str | None] = mapped_column(String(512))
+    dtb_path: Mapped[str | None] = mapped_column(String(512))
+    drive_interface: Mapped[str | None] = mapped_column(String(20))
+    root_dev: Mapped[str | None] = mapped_column(String(50))
+    qemu_extra_args: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

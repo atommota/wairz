@@ -311,6 +311,17 @@ class EmulationService:
         init_path: str | None = None,
         pre_init_script: str | None = None,
         stub_profile: str = "none",
+        cpu: str | None = None,
+        machine: str | None = None,
+        nic_model: str | None = None,
+        mem: int | None = None,
+        smp: int | None = None,
+        kernel_append: str | None = None,
+        initrd_path: str | None = None,
+        dtb_path: str | None = None,
+        drive_interface: str | None = None,
+        root_dev: str | None = None,
+        qemu_extra_args: str | None = None,
     ) -> EmulationSession:
         """Start a new emulation session.
 
@@ -324,6 +335,28 @@ class EmulationService:
             init_path: Override init binary for system mode (e.g., "/bin/sh").
             pre_init_script: Shell script to run before firmware init (system mode).
             stub_profile: Stub library profile ("none", "generic", "tenda").
+
+        System-mode QEMU/boot overrides (all optional — each falls back to an
+        auto-selected default so the common case needs none of them, but the
+        agent can override any of them to iterate on bring-up):
+            cpu: QEMU ``-cpu`` model (e.g. "arm1176", "cortex-a15", "arm926").
+            machine: QEMU ``-M`` machine type (e.g. "versatilepb", "virt"). The
+                NIC model is auto-selected to match the machine.
+            nic_model: QEMU NIC model override (normally auto-derived from the
+                machine, e.g. virt→virtio-net-device, versatilepb→smc91c111).
+            mem: Guest RAM in MB.
+            smp: Number of guest CPUs.
+            kernel_append: Extra kernel cmdline tokens appended last
+                (e.g. "rootwait", "console=ttyS0", "panic=5").
+            initrd_path: Firmware-relative path to an initrd/initramfs image to
+                attach (lets modular kernels load storage/fs drivers).
+            dtb_path: Firmware-relative path to a device-tree blob to attach via
+                ``-dtb`` (DT-only kernels need a matching board dtb). If omitted,
+                a companion dtb registered with the kernel is auto-attached.
+            drive_interface: Root-disk bus ("ide"/"virtio"/"scsi"/"sd"/"mmc").
+            root_dev: Root device for ``root=`` (e.g. "/dev/vda", "/dev/sda").
+            qemu_extra_args: Raw extra arguments appended to the QEMU command
+                line — escape hatch for anything not modeled above.
         """
         if mode not in ("user", "system"):
             raise ValueError("mode must be 'user' or 'system'")
@@ -377,6 +410,17 @@ class EmulationService:
                 init_path=init_path,
                 pre_init_script=pre_init_script,
                 stub_profile=stub_profile,
+                cpu=cpu,
+                machine=machine,
+                nic_model=nic_model,
+                mem=mem,
+                smp=smp,
+                kernel_append=kernel_append,
+                initrd_path=initrd_path,
+                dtb_path=dtb_path,
+                drive_interface=drive_interface,
+                root_dev=root_dev,
+                qemu_extra_args=qemu_extra_args,
             )
             session.container_id = container_id
             session.status = "running"
@@ -762,6 +806,33 @@ echo "Symlink repair: pass1=$PASS1 pass2=$PASS2 pass3=$PASS3"
 
         return None
 
+    def _find_dtb(
+        self,
+        kernel_path: str | None,
+        kernel_name: str | None = None,
+    ) -> str | None:
+        """Find the device-tree blob companion for a kernel, if any.
+
+        Mirrors _find_initrd: checks the kernel service sidecar metadata and the
+        convention <kernel>.dtb. DT-only kernels need this passed via -dtb.
+        """
+        from app.services.kernel_service import KernelService
+
+        if not kernel_path:
+            return None
+
+        svc = KernelService()
+        if kernel_name:
+            dtb = svc._dtb_path(kernel_name)
+            if dtb:
+                return dtb
+
+        dtb = svc._dtb_path(os.path.basename(kernel_path))
+        if dtb:
+            return dtb
+
+        return None
+
     # Locations searched (in order) for a usable POSIX shell inside the
     # firmware rootfs when `/bin/sh` is missing. Order matters: the most
     # canonical-looking paths come first so we don't pick a buried
@@ -1054,6 +1125,17 @@ echo "[wairz] Starting firmware init..."
         init_path: str | None = None,
         pre_init_script: str | None = None,
         stub_profile: str = "none",
+        cpu: str | None = None,
+        machine: str | None = None,
+        nic_model: str | None = None,
+        mem: int | None = None,
+        smp: int | None = None,
+        kernel_append: str | None = None,
+        initrd_path: str | None = None,
+        dtb_path: str | None = None,
+        drive_interface: str | None = None,
+        root_dev: str | None = None,
+        qemu_extra_args: str | None = None,
     ) -> str:
         """Spawn a Docker container for this emulation session."""
         client = self._get_docker_client()
@@ -1090,12 +1172,42 @@ echo "[wairz] Starting firmware init..."
                 kernel_name=kernel_name,
                 firmware_kernel_path=firmware_kernel_path,
             )
-            # Look for companion initrd
-            initrd_backend_path = self._find_initrd(
-                kernel_backend_path, kernel_name
-            )
-            if initrd_backend_path:
-                logger.info("Found initrd: %s", initrd_backend_path)
+            if initrd_path:
+                # Agent-supplied initrd: a path inside the firmware filesystem
+                # (e.g. "/_carved/initrd.img"). Resolve against the extracted
+                # root with the sandbox guard, then copy it in like the kernel.
+                resolved = validate_path(extracted_path, initrd_path)
+                if not os.path.isfile(resolved):
+                    raise ValueError(
+                        f"initrd not found at firmware path '{initrd_path}' "
+                        f"(resolved to {resolved})"
+                    )
+                initrd_backend_path = resolved
+                logger.info("Using agent-supplied initrd: %s", initrd_backend_path)
+            else:
+                # Look for companion initrd next to the kernel
+                initrd_backend_path = self._find_initrd(
+                    kernel_backend_path, kernel_name
+                )
+                if initrd_backend_path:
+                    logger.info("Found initrd: %s", initrd_backend_path)
+
+            # Resolve the device-tree blob the same way: agent-supplied
+            # firmware path wins, else a companion dtb registered with the kernel.
+            dtb_backend_path = None
+            if dtb_path:
+                resolved = validate_path(extracted_path, dtb_path)
+                if not os.path.isfile(resolved):
+                    raise ValueError(
+                        f"dtb not found at firmware path '{dtb_path}' "
+                        f"(resolved to {resolved})"
+                    )
+                dtb_backend_path = resolved
+                logger.info("Using agent-supplied dtb: %s", dtb_backend_path)
+            else:
+                dtb_backend_path = self._find_dtb(kernel_backend_path, kernel_name)
+                if dtb_backend_path:
+                    logger.info("Found companion dtb: %s", dtb_backend_path)
 
         # Container-internal path where the kernel will be placed
         CONTAINER_KERNEL_PATH = "/tmp/kernel"
@@ -1211,6 +1323,17 @@ echo "[wairz] Starting firmware init..."
                 initrd_arg = CONTAINER_INITRD_PATH
                 logger.info("Copied initrd to container: %s", initrd_backend_path)
 
+            # Copy device-tree blob if available; passed to the launcher via
+            # WAIRZ_DTB so the script adds -dtb.
+            CONTAINER_DTB_PATH = "/tmp/dtb"
+            dtb_container_path = None
+            if dtb_backend_path and os.path.isfile(dtb_backend_path):
+                self._copy_file_to_container(
+                    container, dtb_backend_path, CONTAINER_DTB_PATH,
+                )
+                dtb_container_path = CONTAINER_DTB_PATH
+                logger.info("Copied dtb to container: %s", dtb_backend_path)
+
             # Inject init wrapper into the firmware rootfs. The wrapper
             # auto-mounts proc/sysfs, configures networking, sets LD_PRELOAD
             # based on stub_profile, sources the optional pre-init script,
@@ -1237,12 +1360,91 @@ echo "[wairz] Starting firmware init..."
                 initrd_arg,
                 wrapper_init,
             ]
-            container.exec_run(cmd, detach=True)
+
+            # Agent-supplied QEMU/boot overrides are passed to the launch script
+            # as WAIRZ_* environment variables. An auto-selected -cpu default is
+            # applied when the agent didn't specify one (e.g. arm1176 for the
+            # dhruvvyas90-style RPi kernels, which fault on versatilepb's default
+            # arm926 before console init); the agent can always override it.
+            effective_cpu = cpu or self._default_system_cpu(
+                session.architecture, kernel_backend_path
+            )
+            env = self._build_system_env(
+                cpu=effective_cpu,
+                machine=machine,
+                nic_model=nic_model,
+                mem=mem,
+                smp=smp,
+                kernel_append=kernel_append,
+                drive_interface=drive_interface,
+                root_dev=root_dev,
+                qemu_extra_args=qemu_extra_args,
+            )
+            if dtb_container_path:
+                env["WAIRZ_DTB"] = dtb_container_path
+            container.exec_run(cmd, detach=True, environment=env or None)
 
             # Health check: wait briefly to catch early QEMU failures
             await self._await_system_startup(container)
 
         return container.id
+
+    @staticmethod
+    def _build_system_env(
+        cpu: str | None,
+        machine: str | None,
+        nic_model: str | None,
+        mem: int | None,
+        smp: int | None,
+        kernel_append: str | None,
+        drive_interface: str | None,
+        root_dev: str | None,
+        qemu_extra_args: str | None,
+    ) -> dict[str, str]:
+        """Map system-mode override params to WAIRZ_* env vars for the launcher.
+
+        Only set keys are included; start-system-mode.sh keeps its per-arch
+        default for any variable that is absent.
+        """
+        env: dict[str, str] = {}
+        if cpu:
+            env["WAIRZ_CPU"] = str(cpu)
+        if machine:
+            env["WAIRZ_MACHINE"] = str(machine)
+        if nic_model:
+            env["WAIRZ_NIC_MODEL"] = str(nic_model)
+        if mem:
+            env["WAIRZ_MEM"] = str(mem)
+        if smp:
+            env["WAIRZ_SMP"] = str(smp)
+        if kernel_append:
+            env["WAIRZ_KERNEL_APPEND"] = str(kernel_append)
+        if drive_interface:
+            env["WAIRZ_DRIVE_IF"] = str(drive_interface)
+        if root_dev:
+            env["WAIRZ_ROOT_DEV"] = str(root_dev)
+        if qemu_extra_args:
+            env["WAIRZ_QEMU_EXTRA"] = str(qemu_extra_args)
+        return env
+
+    @staticmethod
+    def _default_system_cpu(arch: str | None, kernel_path: str | None) -> str | None:
+        """Pick a sensible default ``-cpu`` for a system-mode boot, or None.
+
+        The bundled dhruvvyas90 QEMU "RPi" kernels (named like
+        ``kernel-qemu-*-buster/jessie/stretch-arm``) are ARMv6/arm1176 builds.
+        On ``-M versatilepb`` QEMU defaults to arm926 (ARMv5), so those kernels
+        fault before console init — the classic "running but no serial output"
+        symptom. Defaulting to ``arm1176`` for these makes them boot. This is a
+        best-effort default only; the agent can override ``cpu`` for any board.
+        """
+        if arch not in ("arm", "armhf", "armel"):
+            return None
+        name = os.path.basename(kernel_path or "").lower()
+        rpi_markers = ("buster", "jessie", "stretch", "rpi", "raspberrypi", "arm1176")
+        if any(marker in name for marker in rpi_markers):
+            return "arm1176"
+        return None
 
     async def _await_system_startup(
         self,
@@ -1676,13 +1878,23 @@ echo "[wairz] Starting firmware init..."
                     session.stopped_at = datetime.now(timezone.utc)
                     await self.db.flush()
                 elif session.mode == "system":
-                    # Container is running, but check if QEMU process inside is alive
+                    # Container (sleep infinity) outlives QEMU, so a running
+                    # container says nothing about QEMU's health. Probe the
+                    # processes inside, distinguishing three states:
+                    #   qemu   — QEMU is alive → still running
+                    #   script — start-system-mode.sh is still preparing the
+                    #            ext4 rootfs / decompressing the kernel; QEMU
+                    #            hasn't been exec'd yet → still starting, not dead
+                    #   none   — neither is alive → QEMU exited (e.g. a fatal
+                    #            argument error) → surface as error
                     try:
                         check = container.exec_run(
-                            ["sh", "-c", "pgrep -f 'qemu-system' >/dev/null 2>&1; echo $?"],
+                            ["sh", "-c",
+                             "pgrep -f 'qemu-system' >/dev/null 2>&1 && echo qemu || "
+                             "(pgrep -f 'start-system-mode' >/dev/null 2>&1 && echo script || echo none)"],
                         )
                         output = check.output.decode("utf-8", errors="replace").strip()
-                        if output != "0":
+                        if output == "none":
                             log = self._read_container_qemu_log(container)
                             session.status = "error"
                             session.error_message = (
@@ -1785,6 +1997,17 @@ echo "[wairz] Starting firmware init..."
         init_path: str | None = None,
         pre_init_script: str | None = None,
         stub_profile: str = "none",
+        cpu: str | None = None,
+        machine: str | None = None,
+        nic_model: str | None = None,
+        mem: int | None = None,
+        smp: int | None = None,
+        kernel_append: str | None = None,
+        initrd_path: str | None = None,
+        dtb_path: str | None = None,
+        drive_interface: str | None = None,
+        root_dev: str | None = None,
+        qemu_extra_args: str | None = None,
     ) -> EmulationPreset:
         """Create a new emulation preset for a project."""
         preset = EmulationPreset(
@@ -1800,6 +2023,17 @@ echo "[wairz] Starting firmware init..."
             init_path=init_path,
             pre_init_script=pre_init_script,
             stub_profile=stub_profile,
+            cpu=cpu,
+            machine=machine,
+            nic_model=nic_model,
+            mem=mem,
+            smp=smp,
+            kernel_append=kernel_append,
+            initrd_path=initrd_path,
+            dtb_path=dtb_path,
+            drive_interface=drive_interface,
+            root_dev=root_dev,
+            qemu_extra_args=qemu_extra_args,
         )
         self.db.add(preset)
         await self.db.flush()

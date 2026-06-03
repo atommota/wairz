@@ -18,6 +18,125 @@ from app.services.kernel_service import KernelService
 from sqlalchemy import select
 
 
+# System-mode QEMU/boot override knobs. Shared by start_emulation (per-run)
+# and save_emulation_preset (persisted) so the agent can iterate on bring-up —
+# sweeping machine/CPU/console/root-device/initrd/cmdline the way a human turns
+# the qemu-system-* command line — without a code change per board. Every knob
+# is optional and falls back to an auto-selected default; an override only
+# matters when a default misses.
+_SYSTEM_OVERRIDE_PROPERTIES = {
+    "cpu": {
+        "type": "string",
+        "description": (
+            "QEMU -cpu model for system mode (e.g. 'arm1176', 'cortex-a15', "
+            "'arm926', '34Kf'). Override when the kernel faults before any "
+            "serial output (a CPU/kernel mismatch). For the bundled "
+            "dhruvvyas90 'buster/jessie/stretch' ARM (RPi) kernels this "
+            "auto-defaults to 'arm1176'; for most firmware you can omit it."
+        ),
+    },
+    "machine": {
+        "type": "string",
+        "description": (
+            "QEMU -M machine type (e.g. 'versatilepb', 'virt'). Defaults per "
+            "architecture (arm→versatilepb, aarch64→virt, mips/mipsel→malta, "
+            "x86→pc). Use 'virt' for a modern ARM board with virtio devices "
+            "(pair with a virt-compatible kernel, drive_interface='virtio', "
+            "root_dev='/dev/vda'). The NIC model is auto-selected to match the "
+            "machine (versatilepb→smc91c111, virt→virtio-net-device, "
+            "malta→pcnet, pc→e1000), so changing the machine does not strand a "
+            "NIC the board can't host."
+        ),
+    },
+    "nic_model": {
+        "type": "string",
+        "description": (
+            "QEMU NIC model. Normally auto-selected from the machine, so you "
+            "rarely need this. Override only if the auto choice is wrong "
+            "(e.g. 'virtio-net-pci', 'e1000', 'rtl8139', 'smc91c111'). "
+            "smc91c111/lan9118 are wired as on-board (-nic); others as a "
+            "pluggable -device."
+        ),
+    },
+    "mem": {
+        "type": "integer",
+        "description": (
+            "Guest RAM in MB. Defaults per machine (versatilepb/malta cap at "
+            "256; virt/pc default 512). versatilepb cannot exceed 256."
+        ),
+    },
+    "smp": {
+        "type": "integer",
+        "description": "Number of guest CPUs (QEMU -smp). Default 1.",
+    },
+    "kernel_append": {
+        "type": "string",
+        "description": (
+            "Extra kernel command-line tokens, appended after the auto-built "
+            "base ('root=<root_dev> rw console=<console> panic=0 [init=...]'). "
+            "Appended last, so duplicated keys take this value where the kernel "
+            "uses the final one. Examples: 'rootwait', 'console=ttyS0', "
+            "'panic=5', 'earlyprintk'."
+        ),
+    },
+    "initrd": {
+        "type": "string",
+        "description": (
+            "Firmware-relative path to an initrd/initramfs image to attach via "
+            "QEMU -initrd (e.g. '/_carved/initrd.img'). Needed for modular "
+            "kernels that load storage/filesystem drivers from an initramfs to "
+            "mount root. If omitted, a companion initrd next to the kernel is "
+            "auto-detected."
+        ),
+    },
+    "dtb": {
+        "type": "string",
+        "description": (
+            "Firmware-relative path to a device-tree blob (.dtb) to attach via "
+            "QEMU -dtb. DT-only kernels (e.g. the bundled buster RPi ARM kernel) "
+            "fail with 'invalid dtb and unrecognized/unsupported machine ID' "
+            "without a matching board dtb. If omitted, a companion dtb "
+            "registered with the kernel is auto-attached — use "
+            "attach_kernel_companion to fetch one (e.g. versatile-pb.dtb) by URL "
+            "onto a kernel that lacks one."
+        ),
+    },
+    "drive_interface": {
+        "type": "string",
+        "description": (
+            "Root-disk bus for the rootfs image: 'ide' (default on "
+            "versatilepb/malta/pc → /dev/sda), 'virtio' (virt → /dev/vda), "
+            "'scsi', 'sd', or 'mmc'. Set this together with root_dev so the "
+            "kernel's root= matches the bus."
+        ),
+    },
+    "root_dev": {
+        "type": "string",
+        "description": (
+            "Root device for the kernel 'root=' argument (e.g. '/dev/sda', "
+            "'/dev/vda'). Defaults to match the machine's disk bus. Override "
+            "when changing drive_interface."
+        ),
+    },
+    "qemu_extra_args": {
+        "type": "string",
+        "description": (
+            "Raw extra arguments appended verbatim to the qemu-system-* command "
+            "line (space-separated, word-split into tokens). Escape hatch for "
+            "anything not modeled by the other knobs, e.g. '-device "
+            "virtio-rng-pci' or '-dtb /tmp/board.dtb'."
+        ),
+    },
+}
+
+# Keys that map 1:1 from input/preset to start_session kwargs. `initrd` is the
+# MCP-facing name; it maps to the `initrd_path` kwarg/column (handled explicitly).
+_SYSTEM_OVERRIDE_KEYS = (
+    "cpu", "machine", "nic_model", "mem", "smp", "kernel_append",
+    "drive_interface", "root_dev", "qemu_extra_args",
+)
+
+
 def register_emulation_tools(registry: ToolRegistry) -> None:
     """Register all emulation tools with the given registry."""
 
@@ -92,6 +211,54 @@ def register_emulation_tools(registry: ToolRegistry) -> None:
     )
 
     registry.register(
+        name="attach_kernel_companion",
+        description=(
+            "Download a device-tree blob (dtb) or initrd/initramfs from a URL "
+            "and attach it to an EXISTING kernel as its companion, so it is "
+            "auto-attached on the next system-mode boot. Use this when a kernel "
+            "needs a companion that isn't bundled:\n"
+            "- DT-only kernels (e.g. the bundled 'kernel-qemu-*-buster-arm') boot "
+            "on '-M versatilepb -cpu arm1176' only with a matching board dtb. "
+            "Fetch 'versatile-pb.dtb' (it ships with the dhruvvyas90 RPi kernel "
+            "distribution) and attach it as kind='dtb'.\n"
+            "- Modular kernels need an initrd to load storage/filesystem drivers "
+            "before mounting root; attach it as kind='initrd'.\n\n"
+            "The download is SSRF-protected and follows cross-host redirects "
+            "(e.g. regional mirrors). dtb files are validated for the FDT magic. "
+            "After attaching, just start_emulation normally — the companion is "
+            "picked up automatically (or reference it explicitly via the dtb/"
+            "initrd parameter)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "kernel_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of the existing kernel to attach the companion to "
+                        "(from list_available_kernels)."
+                    ),
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["dtb", "initrd"],
+                    "description": "Companion type: 'dtb' (device tree) or 'initrd'.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": (
+                        "Direct download URL (http/https). Cross-host redirects "
+                        "to mirrors are followed; private/loopback hosts blocked."
+                    ),
+                },
+            },
+            "required": ["kernel_name", "kind", "url"],
+        },
+        handler=_handle_attach_kernel_companion,
+        applies_to=("linux",),
+    )
+
+    registry.register(
         name="start_emulation",
         description=(
             "Start a QEMU-based emulation session for dynamic firmware analysis. "
@@ -113,7 +280,21 @@ def register_emulation_tools(registry: ToolRegistry) -> None:
             "- Setting environment variables for the firmware's init\n\n"
             "Use emulation to VALIDATE static findings: test if default credentials "
             "work, check if services are accessible, verify network behavior. "
-            "Always stop sessions when done to free resources."
+            "Always stop sessions when done to free resources.\n\n"
+            "SYSTEM-MODE TUNING: When a boot misbehaves you can override the QEMU "
+            "machine/CPU/memory and the kernel command line directly — cpu, "
+            "machine, mem, smp, kernel_append, initrd, drive_interface, root_dev, "
+            "and a raw qemu_extra_args escape hatch. All are auto-defaulted, so "
+            "the common case needs none. Iterate with these instead of giving up: "
+            "e.g. if `get_emulation_logs` shows ZERO kernel output (status running "
+            "but serial silent), the kernel likely faulted on a CPU mismatch — try "
+            "a different cpu (RPi/buster kernels need cpu='arm1176'); if it boots a "
+            "bit then says 'invalid dtb and unrecognized/unsupported machine ID', "
+            "the kernel is DT-only and needs a device tree — pass dtb (or use "
+            "attach_kernel_companion to fetch the matching .dtb by URL, e.g. "
+            "versatile-pb.dtb for the bundled buster kernel); if it panics with "
+            "'Unable to mount root fs', fix root_dev/drive_interface or attach an "
+            "initrd. Save a working combination with save_emulation_preset."
         ),
         input_schema={
             "type": "object",
@@ -187,6 +368,10 @@ def register_emulation_tools(registry: ToolRegistry) -> None:
                         "Required for Tenda firmware (AC8, AC15, etc.)."
                     ),
                 },
+                # System-mode QEMU/boot overrides (cpu, machine, mem, smp,
+                # kernel_append, initrd, drive_interface, root_dev,
+                # qemu_extra_args). All optional; auto-defaulted but overridable.
+                **_SYSTEM_OVERRIDE_PROPERTIES,
             },
             "required": ["mode"],
         },
@@ -524,6 +709,9 @@ def register_emulation_tools(registry: ToolRegistry) -> None:
                     "enum": ["none", "generic", "tenda"],
                     "description": "Stub library profile (default: 'none')",
                 },
+                # Persist the same system-mode QEMU/boot overrides accepted by
+                # start_emulation, so a working bring-up can be saved & replayed.
+                **_SYSTEM_OVERRIDE_PROPERTIES,
             },
             "required": ["name", "mode"],
         },
@@ -601,7 +789,13 @@ async def _handle_list_kernels(input: dict, context: ToolContext) -> str:
     for k in kernels:
         size_mb = k["file_size"] / (1024 * 1024)
         desc = f" — {k['description']}" if k.get("description") else ""
-        lines.append(f"  {k['name']} [{k['architecture']}] ({size_mb:.1f} MB){desc}")
+        companions = []
+        if k.get("has_initrd"):
+            companions.append("initrd")
+        if k.get("has_dtb"):
+            companions.append("dtb")
+        comp = f" [+{'/'.join(companions)}]" if companions else ""
+        lines.append(f"  {k['name']} [{k['architecture']}] ({size_mb:.1f} MB){comp}{desc}")
 
     return "\n".join(lines)
 
@@ -647,6 +841,39 @@ async def _handle_download_kernel(input: dict, context: ToolContext) -> str:
         return f"Error downloading kernel: {exc}"
 
 
+async def _handle_attach_kernel_companion(input: dict, context: ToolContext) -> str:
+    """Download a dtb/initrd companion and attach it to an existing kernel."""
+    kernel_name = input.get("kernel_name", "").strip()
+    kind = input.get("kind", "").strip()
+    url = input.get("url", "").strip()
+
+    if not kernel_name or not kind or not url:
+        return "Error: kernel_name, kind, and url are required."
+    if kind not in ("dtb", "initrd"):
+        return "Error: kind must be 'dtb' or 'initrd'."
+
+    svc = KernelService()
+    try:
+        info = await svc.download_companion(kernel_name=kernel_name, url=url, kind=kind)
+    except ValueError as exc:
+        return f"Error attaching {kind}: {exc}"
+    except Exception as exc:
+        return f"Error attaching {kind}: {exc}"
+
+    companions = []
+    if info.get("has_initrd"):
+        companions.append("initrd")
+    if info.get("has_dtb"):
+        companions.append("dtb")
+    return (
+        f"Attached {kind} to kernel '{kernel_name}'.\n"
+        f"  Source: {url}\n"
+        f"  Companions now present: {', '.join(companions) or 'none'}\n\n"
+        f"It will be auto-attached on the next system-mode boot of this kernel "
+        f"(or reference it explicitly via start_emulation's {kind} parameter)."
+    )
+
+
 async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
     """Start an emulation session."""
     mode = input.get("mode", "user")
@@ -657,6 +884,10 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
     init_path = input.get("init_path")
     pre_init_script = input.get("pre_init_script")
     stub_profile = input.get("stub_profile", "none")
+    # System-mode QEMU/boot overrides (all optional; auto-defaulted in service).
+    overrides = {k: input.get(k) for k in _SYSTEM_OVERRIDE_KEYS if input.get(k) is not None}
+    initrd_path = input.get("initrd")
+    dtb_path = input.get("dtb")
 
     if mode == "user" and not binary_path:
         return "Error: binary_path is required for user-mode emulation."
@@ -689,6 +920,9 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
             init_path=init_path,
             pre_init_script=pre_init_script,
             stub_profile=stub_profile,
+            initrd_path=initrd_path,
+            dtb_path=dtb_path,
+            **overrides,
         )
         await context.db.commit()
     except ValueError as exc:
@@ -721,6 +955,22 @@ async def _handle_start_emulation(input: dict, context: ToolContext) -> str:
             lines.append(f"Stub profile: {stub_profile}")
         if pre_init_script:
             lines.append("Pre-init script: injected and will run before firmware init.")
+        applied = dict(overrides)
+        if initrd_path:
+            applied["initrd"] = initrd_path
+        if dtb_path:
+            applied["dtb"] = dtb_path
+        if applied:
+            lines.append(
+                "QEMU overrides: "
+                + ", ".join(f"{k}={v}" for k, v in applied.items())
+            )
+        lines.append(
+            "Tip: if status is 'running' but `run_command_in_emulation` times out, "
+            "check `get_emulation_logs` for the actual QEMU command line / machine / "
+            "CPU and any boot output, then re-tune (cpu, machine, root_dev, initrd, "
+            "kernel_append) and restart."
+        )
 
     lines.append("")
     lines.append(
@@ -2300,6 +2550,9 @@ async def _handle_save_preset(input: dict, context: ToolContext) -> str:
 
     svc = EmulationService(context.db)
     try:
+        overrides = {
+            k: input.get(k) for k in _SYSTEM_OVERRIDE_KEYS if input.get(k) is not None
+        }
         preset = await svc.create_preset(
             project_id=context.project_id,
             name=name,
@@ -2312,6 +2565,9 @@ async def _handle_save_preset(input: dict, context: ToolContext) -> str:
             init_path=input.get("init_path"),
             pre_init_script=input.get("pre_init_script"),
             stub_profile=input.get("stub_profile", "none"),
+            initrd_path=input.get("initrd"),
+            dtb_path=input.get("dtb"),
+            **overrides,
         )
         await context.db.commit()
     except Exception as exc:
@@ -2329,6 +2585,9 @@ async def _handle_save_preset(input: dict, context: ToolContext) -> str:
         lines.append(f"  Stub profile: {preset.stub_profile}")
     if preset.pre_init_script:
         lines.append(f"  Pre-init script: {len(preset.pre_init_script)} chars")
+    ov = _preset_overrides_summary(preset)
+    if ov:
+        lines.append(f"  QEMU overrides: {ov}")
     lines.append("")
     lines.append("Use start_emulation_from_preset to start a session with this preset.")
 
@@ -2357,8 +2616,24 @@ async def _handle_list_presets(input: dict, context: ToolContext) -> str:
         if p.port_forwards:
             pf_strs = [f"{pf['host']}:{pf['guest']}" for pf in p.port_forwards]
             lines.append(f"    Ports: {', '.join(pf_strs)}")
+        ov = _preset_overrides_summary(p)
+        if ov:
+            lines.append(f"    QEMU overrides: {ov}")
 
     return "\n".join(lines)
+
+
+def _preset_overrides_summary(p: EmulationPreset) -> str:
+    """One-line summary of a preset's non-empty system-mode QEMU/boot overrides."""
+    fields = [
+        ("cpu", p.cpu), ("machine", p.machine), ("nic_model", p.nic_model),
+        ("mem", p.mem), ("smp", p.smp),
+        ("kernel_append", p.kernel_append), ("initrd", p.initrd_path),
+        ("dtb", p.dtb_path),
+        ("drive_interface", p.drive_interface), ("root_dev", p.root_dev),
+        ("qemu_extra_args", p.qemu_extra_args),
+    ]
+    return ", ".join(f"{k}={v}" for k, v in fields if v)
 
 
 async def _handle_start_from_preset(input: dict, context: ToolContext) -> str:
@@ -2402,6 +2677,18 @@ async def _handle_start_from_preset(input: dict, context: ToolContext) -> str:
         "init_path": preset.init_path,
         "pre_init_script": preset.pre_init_script,
         "stub_profile": preset.stub_profile,
+        # System-mode QEMU/boot overrides (column name initrd_path → input "initrd")
+        "cpu": preset.cpu,
+        "machine": preset.machine,
+        "nic_model": preset.nic_model,
+        "mem": preset.mem,
+        "smp": preset.smp,
+        "kernel_append": preset.kernel_append,
+        "initrd": preset.initrd_path,
+        "dtb": preset.dtb_path,
+        "drive_interface": preset.drive_interface,
+        "root_dev": preset.root_dev,
+        "qemu_extra_args": preset.qemu_extra_args,
     }
 
     result = await _handle_start_emulation(start_input, context)
