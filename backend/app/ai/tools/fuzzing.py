@@ -342,6 +342,16 @@ async def _handle_analyze_target(input: dict, context: ToolContext) -> str:
         lines.append(f"    Canary: {'yes' if prot.get('canary') else 'NO'}")
         lines.append(f"    PIE: {'yes' if prot.get('pie') else 'NO'}")
 
+    if analysis.get("lib_backed"):
+        deps = ", ".join(analysis.get("non_libc_needed", [])) or "shared libraries"
+        lines.append("")
+        lines.append(
+            f"  Lib-backed target: most logic is in {deps} (small .text). "
+            "start_fuzzing_campaign will auto-enable AFL_INST_LIBS=1 so QEMU-mode "
+            "coverage includes the library code — without it coverage stays "
+            "near-zero (only the thin wrapper is instrumented)."
+        )
+
     if score >= 60:
         lines.append("")
         lines.append("Recommendation: This binary is a good fuzzing target. "
@@ -998,26 +1008,47 @@ async def _handle_diagnose_campaign(input: dict, context: ToolContext) -> str:
                 issues.append(
                     f"Very low coverage ({bitmap_cvg}) after {total_execs} executions"
                 )
-                if not config.get("desock"):
-                    # Check if this might be a network binary
-                    fw_result = await context.db.execute(
-                        select(Firmware).where(Firmware.id == campaign.firmware_id)
+                # Pull the target analysis once — both the lib-backed and
+                # network checks below need it.
+                analysis = None
+                fw_result = await context.db.execute(
+                    select(Firmware).where(Firmware.id == campaign.firmware_id)
+                )
+                firmware = fw_result.scalar_one_or_none()
+                if firmware:
+                    try:
+                        analysis = await svc.analyze_target(
+                            firmware, campaign.binary_path
+                        )
+                    except Exception:
+                        analysis = None
+
+                env_cfg = config.get("environment") or {}
+                inst_libs_on = str(env_cfg.get("AFL_INST_LIBS", "")).strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
+                before = len(recommendations)
+
+                # Lib-backed target without AFL_INST_LIBS — the #1 silent
+                # near-zero-coverage cause (feedback #3). Normally auto-enabled
+                # at start, so this catches an explicit disable or a heuristic
+                # miss (.text just over the threshold).
+                if analysis and analysis.get("lib_backed") and not inst_libs_on:
+                    deps = ", ".join(analysis.get("non_libc_needed", [])) or "a shared library"
+                    recommendations.append(
+                        f"Target delegates its real work to {deps} but AFL_INST_LIBS "
+                        "is not set — QEMU mode is only instrumenting the thin wrapper. "
+                        "ACTION: stop and restart with environment: {\"AFL_INST_LIBS\": \"1\"}."
                     )
-                    firmware = fw_result.scalar_one_or_none()
-                    if firmware:
-                        try:
-                            analysis = await svc.analyze_target(
-                                firmware, campaign.binary_path
-                            )
-                            if analysis.get("recommended_strategy") == "network":
-                                recommendations.append(
-                                    "This binary is a NETWORK DAEMON but desock is disabled. "
-                                    "AFL++ fuzz data never reaches the network parsing code. "
-                                    "ACTION: Stop this campaign and restart with desock: true"
-                                )
-                        except Exception:
-                            pass
-                    if not recommendations:
+
+                if not config.get("desock"):
+                    if analysis and analysis.get("recommended_strategy") == "network":
+                        recommendations.append(
+                            "This binary is a NETWORK DAEMON but desock is disabled. "
+                            "AFL++ fuzz data never reaches the network parsing code. "
+                            "ACTION: Stop this campaign and restart with desock: true"
+                        )
+                    if len(recommendations) == before:
                         recommendations.append(
                             "Coverage is very low. The binary may not be processing "
                             "AFL++ input effectively. Consider enabling desock (if it's "

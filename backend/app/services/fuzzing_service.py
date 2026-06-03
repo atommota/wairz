@@ -76,6 +76,63 @@ DESOCK_LIB_MAP: dict[str, str] = {
     "mipsel": "/opt/desock/desock_mipsel.so",
 }
 
+# Shared libraries that are part of the C runtime. They don't make a target
+# "logic-lives-in-a-.so"; ignore them when deciding whether AFL_INST_LIBS
+# should default on (feedback #3).
+_LIBC_PREFIXES: tuple[str, ...] = (
+    "libc.so", "libc-", "ld-", "ld.so", "ld-linux", "ld-musl", "ld-uclibc",
+    "libgcc_s", "libpthread", "libm.so", "libm-", "libdl.so", "librt.so",
+    "libresolv", "libnsl", "libcrypt", "libutil", "libssp", "libuclibc",
+)
+# A self-contained binary has a large .text; a thin CLI wrapper that delegates
+# its real work to a shared library (e.g. xmllint → libxml2) has a small one.
+_LIB_BACKED_TEXT_MAX = 32 * 1024
+
+
+def _is_libc_lib(name: str) -> bool:
+    n = name.lower()
+    return any(n.startswith(p) for p in _LIBC_PREFIXES)
+
+
+def _elf_lib_backed(elf_path: str) -> dict:
+    """Decide whether a binary's real logic lives in shared libraries.
+
+    AFL++ QEMU mode instruments only the main object's code range by default,
+    so a thin CLI wrapper shows near-zero coverage unless ``AFL_INST_LIBS=1`` is
+    set (feedback #3). Returns ``{lib_backed, needed, non_libc_needed,
+    text_size}``; ``lib_backed`` is True when the binary has a non-libc shared
+    dependency AND a small ``.text`` (i.e. it delegates the work). Best-effort;
+    never raises.
+    """
+    info: dict = {
+        "lib_backed": False, "needed": [], "non_libc_needed": [],
+        "text_size": None,
+    }
+    try:
+        from elftools.elf.dynamic import DynamicSection
+        from elftools.elf.elffile import ELFFile
+
+        with open(elf_path, "rb") as f:
+            elf = ELFFile(f)
+            needed: list[str] = []
+            dyn = elf.get_section_by_name(".dynamic")
+            if isinstance(dyn, DynamicSection):
+                for tag in dyn.iter_tags("DT_NEEDED"):
+                    needed.append(tag.needed)
+            text = elf.get_section_by_name(".text")
+            text_size = text["sh_size"] if text is not None else None
+
+        non_libc = [n for n in needed if not _is_libc_lib(n)]
+        info["needed"] = needed
+        info["non_libc_needed"] = non_libc
+        info["text_size"] = text_size
+        info["lib_backed"] = bool(non_libc) and (
+            text_size is not None and text_size < _LIB_BACKED_TEXT_MAX
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics only, never fatal
+        logger.debug("lib-backed detection failed for %s: %s", elf_path, exc)
+    return info
+
 
 class FuzzingService:
     """Manages AFL++ fuzzing campaign lifecycle via Docker containers."""
@@ -265,6 +322,10 @@ class FuzzingService:
         else:
             strategy = "stdin"
 
+        # Whether the binary's real logic lives in shared libraries — drives
+        # the AFL_INST_LIBS default (feedback #3).
+        libinfo = _elf_lib_backed(full_path)
+
         return {
             "binary_path": binary_path,
             "fuzzing_score": min(100, score),
@@ -276,6 +337,10 @@ class FuzzingService:
             "function_count": function_count,
             "imports_of_interest": found_sinks + found_input + found_network,
             "file_size": file_size,
+            "lib_backed": libinfo["lib_backed"],
+            "needed_libs": libinfo["needed"],
+            "non_libc_needed": libinfo["non_libc_needed"],
+            "text_size": libinfo["text_size"],
         }
 
     async def _count_active_campaigns(self, project_id: UUID) -> int:
@@ -443,8 +508,34 @@ class FuzzingService:
             timeout_ms = config.get("timeout_per_exec", 1000)
             binary_in_firmware = campaign.binary_path.lstrip("/")
 
-            # Extra environment variables for the target
-            extra_env = config.get("environment") or {}
+            # Extra environment variables for the target.
+            extra_env = dict(config.get("environment") or {})
+
+            # Auto-enable AFL_INST_LIBS for lib-backed targets. In QEMU mode AFL
+            # only instruments the main object's code range, so a thin wrapper
+            # whose real logic is in a .so (e.g. xmllint → libxml2) shows
+            # near-zero coverage. Detect that case and turn it on unless the
+            # caller set it explicitly (feedback #3).
+            if "AFL_INST_LIBS" not in extra_env:
+                try:
+                    target_real = validate_path(
+                        firmware.extracted_path, campaign.binary_path
+                    )
+                    libinfo = _elf_lib_backed(target_real)
+                except Exception:  # noqa: BLE001
+                    libinfo = {"lib_backed": False}
+                if libinfo.get("lib_backed"):
+                    extra_env["AFL_INST_LIBS"] = "1"
+                    logger.info(
+                        "Auto-enabled AFL_INST_LIBS=1 for lib-backed target %s "
+                        "(.text=%s, non-libc deps=%s)",
+                        campaign.binary_path, libinfo.get("text_size"),
+                        libinfo.get("non_libc_needed"),
+                    )
+                    # Persist the effective env so check/diagnose reflect reality.
+                    config = {**(campaign.config or {}), "environment": extra_env}
+                    campaign.config = config
+
             env_prefix = " ".join(
                 f"{k}={v}" for k, v in extra_env.items()
             )
