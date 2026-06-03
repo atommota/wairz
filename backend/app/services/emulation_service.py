@@ -940,6 +940,7 @@ echo "Symlink repair: pass1=$PASS1 pass2=$PASS2 pass3=$PASS3"
         stub_profile: str = "none",
         shell_path: str = "/bin/sh",
         extra_mounts: list[dict] | None = None,
+        cmd_channel_dev: str | None = None,
     ) -> str:
         """Generate a wairz init wrapper script for system-mode emulation.
 
@@ -1024,6 +1025,48 @@ done
 echo "[wairz] Ensured shell on console ${ACTIVE_TTY:-/dev/console}"
 """
 
+        # Dedicated command channel (feedback #6). run_command_in_emulation's
+        # output capture is corrupted on the shared console by command echo and
+        # interleaved kernel printk / syslog / getty. When the launcher wires up
+        # a second, isolated serial/virtio-console device, spawn a persistent
+        # shell on it with echo disabled — serial-exec.sh then talks to that
+        # noise-free channel. Falls back to the console when the device is
+        # absent (kernels/boards without a usable second channel).
+        cmd_channel_block = ""
+        if cmd_channel_dev:
+            # The channel device often appears slightly after init starts
+            # (virtio-serial port probe completes a moment later) and the exact
+            # node varies by transport (virtio-console → /dev/hvc0 or a
+            # /dev/vportNp0 serial port; a 2nd UART → ttyAMA1/ttyS1). Wait for it
+            # in the background, auto-detecting across the candidates, then serve
+            # a persistent echo-disabled shell. serial-exec.sh prefers this
+            # noise-free channel and falls back to the console if it never comes
+            # up. A readiness banner is written to the device so the host side
+            # can confirm the data path.
+            cmd_channel_block = (
+                "\n# --- Dedicated command channel (feedback #6) ---\n"
+                f'WZ_CMD_DEV="{cmd_channel_dev}"\n'
+                '( _wzdev=""\n'
+                '  _n=0\n'
+                '  while [ $_n -lt 60 ]; do\n'
+                '      for _c in "$WZ_CMD_DEV" /dev/hvc0 /dev/vport0p0 /dev/vport1p0 /dev/vport2p0; do\n'
+                '          if [ -n "$_c" ] && [ -e "$_c" ]; then _wzdev="$_c"; break; fi\n'
+                '      done\n'
+                '      [ -n "$_wzdev" ] && break\n'
+                '      _n=$((_n+1)); sleep 0.5\n'
+                '  done\n'
+                '  if [ -n "$_wzdev" ]; then\n'
+                '      stty -echo < "$_wzdev" 2>/dev/null || true\n'
+                '      # Serve a NON-interactive shell: feeding commands through a\n'
+                '      # pipe (cat dev | sh) keeps sh from running interactively,\n'
+                '      # so it adds no prompt and no line-editor (busybox\'s editor\n'
+                '      # would otherwise re-enable echo and corrupt marker capture).\n'
+                '      # Respawns if the command stream ends or is interrupted.\n'
+                '      while : ; do cat "$_wzdev" | /bin/sh > "$_wzdev" 2>&1; done\n'
+                '  fi ) &\n'
+                'echo "[wairz] Command channel watcher started (prefer $WZ_CMD_DEV)"'
+            )
+
         pre_init_block = ""
         if pre_init_script:
             pre_init_block = """
@@ -1091,6 +1134,7 @@ mkdir -p /tmp /var/run 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /var/run 2>/dev/null
 {console_shell_block}
+{cmd_channel_block}
 
 # Configure networking (QEMU user-mode networking uses 10.0.2.0/24)
 # Wait briefly for NIC driver to initialize
@@ -1145,6 +1189,7 @@ echo "[wairz] Starting firmware init..."
         pre_init_script: str | None = None,
         stub_profile: str = "none",
         extra_mounts: list[dict] | None = None,
+        cmd_channel_dev: str | None = None,
     ) -> str:
         """Inject the wairz init wrapper into the firmware rootfs.
 
@@ -1184,6 +1229,7 @@ echo "[wairz] Starting firmware init..."
             stub_profile=stub_profile,
             shell_path=shell_path,
             extra_mounts=extra_mounts,
+            cmd_channel_dev=cmd_channel_dev,
         )
 
         # Write scripts into the container using put_archive (avoids heredoc/escaping issues)
@@ -1482,6 +1528,17 @@ echo "[wairz] Starting firmware init..."
                     eff_mem,
                 )
 
+            # Dedicated command channel transport/device for this board
+            # (feedback #6) — isolates run_command_in_emulation I/O from the
+            # noisy kernel console.
+            cmd_transport, cmd_channel_dev = self._cmd_channel(
+                session.architecture, eff_machine
+            )
+            if cmd_transport:
+                logger.info(
+                    "Command channel: %s on %s", cmd_transport, cmd_channel_dev
+                )
+
             # Copy any extra drive images into the container and work out the
             # guest device each will appear as. They're attached after the root
             # disk (which is the first -drive), so they enumerate from the
@@ -1526,6 +1583,7 @@ echo "[wairz] Starting firmware init..."
                 pre_init_script=pre_init_script,
                 stub_profile=stub_profile,
                 extra_mounts=extra_mounts,
+                cmd_channel_dev=cmd_channel_dev,
             )
 
             pf_str = ""
@@ -1563,6 +1621,8 @@ echo "[wairz] Starting firmware init..."
                 env["WAIRZ_DTB"] = dtb_container_path
             if extra_drive_container_paths:
                 env["WAIRZ_EXTRA_DRIVES"] = ",".join(extra_drive_container_paths)
+            if cmd_transport:
+                env["WAIRZ_CMD_CHANNEL"] = cmd_transport
             container.exec_run(cmd, detach=True, environment=env or None)
 
             # Health check: wait briefly to catch early QEMU failures
@@ -1721,6 +1781,36 @@ echo "[wairz] Starting firmware init..."
             return "/dev/vd" if di == "virtio" else "/dev/sd"
         eff_machine = machine or cls._ARCH_DEFAULT_MACHINE.get(arch or "", "")
         return "/dev/vd" if eff_machine == "virt" else "/dev/sd"
+
+    @classmethod
+    def _cmd_channel(
+        cls, arch: str | None, machine: str | None
+    ) -> tuple[str | None, str | None]:
+        """Pick a dedicated command-channel transport + guest device.
+
+        run_command_in_emulation's output is corrupted on the shared console by
+        command echo and interleaved kernel/syslog noise (feedback #6). A second
+        device isolated from the kernel console fixes this. The transport is
+        machine-specific:
+          - virt → virtio-console (/dev/hvc0); the bundled armvirt kernel has
+            virtio_console + virtio-mmio.
+          - versatilepb (ARM) → a 2nd PL011 UART (/dev/ttyAMA1); the board has
+            several.
+          - pc/malta (x86/MIPS) → a 2nd 16550 (/dev/ttyS1); COM2 on pc.
+        Returns ``(transport, guest_dev)`` where transport is "virtio" or
+        "serial" (passed to the launcher as WAIRZ_CMD_CHANNEL), or ``(None,
+        None)`` for machines without a reliable second channel — the wrapper and
+        serial-exec.sh then fall back to the console.
+        """
+        eff_machine = machine or cls._ARCH_DEFAULT_MACHINE.get(arch or "", "")
+        if eff_machine == "virt":
+            return "virtio", "/dev/hvc0"
+        if eff_machine == "versatilepb":
+            return "serial", "/dev/ttyAMA1"
+        if eff_machine in ("pc", "q35"):
+            return "serial", "/dev/ttyS1"
+        # malta and unknown machines: no reliable second port — use the console.
+        return None, None
 
     async def _await_system_startup(
         self,

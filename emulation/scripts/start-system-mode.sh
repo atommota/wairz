@@ -16,6 +16,10 @@ INIT_PATH="$6"      # optional init binary override (e.g., /bin/sh)
 LOG="/tmp/qemu-system.log"
 SERIAL_SOCK="/tmp/qemu-serial.sock"
 SERIAL_LOG="/tmp/qemu-serial.log"
+# Dedicated command channel (feedback #6): an isolated serial/virtio-console
+# device carries run_command_in_emulation I/O, separate from the kernel
+# console. Wired up only when WAIRZ_CMD_CHANNEL is set by the backend.
+CMD_SOCK="/tmp/qemu-cmd.sock"
 ROOTFS_IMG="/tmp/rootfs.ext4"
 
 # Always create the log file immediately so diagnostics are available
@@ -110,7 +114,7 @@ case "$KERNEL_MAGIC" in
 esac
 
 # Clean up stale files from previous runs
-rm -f "$SERIAL_SOCK" "$SERIAL_LOG" "$ROOTFS_IMG"
+rm -f "$SERIAL_SOCK" "$SERIAL_LOG" "$CMD_SOCK" "$ROOTFS_IMG"
 
 # Create a temporary ext4 image sized to fit the rootfs (2x content + 256MB headroom)
 ROOTFS_MB=$(du -sm "$ROOTFS" 2>/dev/null | cut -f1)
@@ -340,6 +344,26 @@ if [ -n "$WAIRZ_EXTRA_DRIVES" ]; then
     done
 fi
 
+# Dedicated command channel (feedback #6). The backend sets WAIRZ_CMD_CHANNEL
+# to the transport for this machine: "virtio" (virtio-console → /dev/hvc0, used
+# on -M virt) or "serial" (a 2nd UART → /dev/ttyAMA1 or /dev/ttyS1). Both back
+# onto $CMD_SOCK, which serial-exec.sh prefers over the noisy console socket.
+CMD_CHANNEL_ARGS=""
+case "${WAIRZ_CMD_CHANNEL:-}" in
+    virtio)
+        CMD_CHANNEL_ARGS="-chardev socket,id=charcmd0,server=on,wait=off,path=${CMD_SOCK} -device virtio-serial-device -device virtconsole,chardev=charcmd0"
+        echo "Command channel: virtio-console (/dev/hvc0) on $CMD_SOCK"
+        ;;
+    serial)
+        # Second -serial → guest's second UART (serial1). Console stays serial0.
+        CMD_CHANNEL_ARGS="-chardev socket,id=charcmd0,server=on,wait=off,path=${CMD_SOCK} -serial chardev:charcmd0"
+        echo "Command channel: 2nd UART on $CMD_SOCK"
+        ;;
+    *)
+        echo "Command channel: none (run_command_in_emulation uses the console)"
+        ;;
+esac
+
 # Build kernel append string
 APPEND_ARGS="root=$ROOT_DEV rw console=$CONSOLE panic=0"
 if [ -n "$INIT_PATH" ]; then
@@ -374,6 +398,7 @@ exec "$QEMU_BIN" \
     -no-reboot \
     -chardev "$SERIAL_CHARDEV" \
     -serial chardev:charserial0 \
+    $CMD_CHANNEL_ARGS \
     -monitor none \
     -gdb tcp::1234 \
     -kernel "$KERNEL" \
