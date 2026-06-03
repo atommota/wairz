@@ -773,6 +773,12 @@ async def run_server(
         "list_firmware_versions",
     }
 
+    # Tools that mutate the active firmware's unpack metadata; after these run
+    # the cached ProjectState must be reloaded from the DB.
+    _STATE_REFRESHING_TOOLS = {
+        "set_firmware_arch", "set_rootfs", "set_kernel", "redetect",
+    }
+
     # --- Tool dispatch ---
     @server.call_tool()
     async def call_tool(
@@ -827,6 +833,26 @@ async def run_server(
             except Exception:
                 await session.rollback()
                 raise
+
+        # Tools that mutate the firmware's unpack metadata (architecture,
+        # rootfs, kernel) change fields the long-lived ProjectState caches and
+        # that subsequent ToolContexts are built from. Reload state so the next
+        # tool call — and the emulation arch gate — see the new values without
+        # requiring a manual switch_project.
+        if name in _STATE_REFRESHING_TOOLS:
+            try:
+                await _load_project_state(
+                    session_factory,
+                    state.project_id,
+                    state,
+                    host_storage_root,
+                    state.firmware_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to refresh project state after %s", name, exc_info=True
+                )
+
         return [TextContent(type="text", text=result)]
 
     # --- Resources ---

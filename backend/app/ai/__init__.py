@@ -14,6 +14,7 @@ from app.ai.tools.sbom import register_sbom_tools
 from app.ai.tools.security import register_security_tools
 from app.ai.tools.strings import register_string_tools
 from app.ai.tools.uart import register_uart_tools
+from app.ai.tools.unpack_control import register_unpack_control_tools
 
 
 def create_tool_registry() -> ToolRegistry:
@@ -29,6 +30,7 @@ def create_tool_registry() -> ToolRegistry:
     register_sbom_tools(registry)
     register_comparison_tools(registry)
     register_rtos_tools(registry)
+    register_unpack_control_tools(registry)
 
     # C6: features that require the host Docker socket (emulation, fuzzing,
     # carving) or host hardware (the UART serial bridge) aren't available in the
