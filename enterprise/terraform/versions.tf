@@ -10,6 +10,15 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.5"
     }
+    # Drive the in-apply image build/push + SPA publish (deploy.tf).
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
+    }
   }
 
   # Remote state is recommended for any shared/team deployment. Copy

@@ -456,6 +456,39 @@ activity resets its idle timer; empty-queue idle past `ttl` → exits.
   findings + reports all work end-to-end. MCP server connects.
 
 ### Phase 4 — Hardening & polish
+
+**4a — Image & SPA delivery automation. ✅ DONE.** `terraform apply` now builds
+the backend image once and pushes it to **both** ECR repos (backend + ghidra;
+kept as two repos, image pushed twice), then publishes the SPA (S3 sync +
+CloudFront invalidation). No more manual ECR push / S3 sync.
+- **Implemented:** `enterprise/scripts/{image-tag,build-and-push-backend,deploy-spa}.sh`
+  + `terraform/deploy.tf` (`data.external.image_tag`, `null_resource.backend_image`,
+  `null_resource.spa`); `image_tag`/`auto_deploy_images` vars wired into the
+  backend + batch modules; `null`/`external` providers pinned. The backend build
+  reproduces compose's named contexts (`kernels`, `ghidra_scripts`) and forces
+  `--platform linux/amd64`; the SPA needs no build-time config (relative `/api/v1`).
+- **Tag:** git 12-char SHA, `+<dirty8>` for uncommitted edits → deterministic,
+  content-addressed, re-pushes only when source changes.
+- **Out-of-band escape hatch:** `auto_deploy_images=false` + explicit `image_tag`
+  for CI-driven builds. `terraform validate`/infra-only flows need no Docker/Node.
+- **Validated on AWS (2026-06-10, acct 767303321530):** a full `terraform apply`
+  (81 resources) ran the automation end-to-end — backend image built (named
+  contexts `kernels`/`ghidra_scripts` OK), pushed identically to **both** repos
+  @ `12d318cc899e-ba9f9813` (1.55 GB each), SPA synced (7 objects) + CloudFront
+  invalidated. The deployed stack served live: SPA root → 200, `/api/v1/projects`
+  via CloudFront → 200 `[]`, ECS 1/1 `COMPLETED` (cold-start race self-resolved
+  as designed). Torn down clean.
+- **One bug found + fixed during teardown:** the SPA `aws_s3_bucket` lacked
+  `force_destroy`, so once the bucket was populated by the new SPA sync,
+  `terraform destroy` failed with `BucketNotEmpty` (it slipped through before
+  because the bucket was always empty). Added `force_destroy = true` to
+  `modules/storage` (derived artifacts, not user data).
+- Cold-start race (push vs. ECS service create) is documented (service doesn't
+  wait for steady state; ECS retries the pull) — not a hard dependency because
+  both repos live inside their modules (repo→push→service would cycle).
+- **Remaining Phase 4 (below) untouched.**
+
+Remaining hardening:
 - Migration-on-boot race guard (fact #11): run alembic as a one-off ECS task in
   the apply, or a startup advisory lock.
 - CloudWatch logs/dashboards, Batch `maxvCpus` ceiling (cost guardrail),

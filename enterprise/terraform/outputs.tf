@@ -63,6 +63,11 @@ output "backend_ecr_repository_url" {
   value       = module.backend.ecr_repository_url
 }
 
+output "image_tag" {
+  description = "Container image tag deployed to ECS + Batch (auto-derived from git unless overridden)."
+  value       = local.image_tag
+}
+
 output "cognito_user_pool_id" {
   value = module.auth.user_pool_id
 }

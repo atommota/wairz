@@ -49,6 +49,20 @@ variable "redis_node_type" {
   default     = "cache.t4g.micro"
 }
 
+# --- Image & SPA delivery (deploy.tf, Phase 4) ------------------------------
+
+variable "auto_deploy_images" {
+  description = "Build + push the backend/Ghidra image and publish the SPA during `terraform apply`. Requires Docker (with buildx), Node/npm, and the AWS CLI on the machine running Terraform. Set false to manage builds out-of-band (e.g. CI): then push to the two ECR repos and sync the SPA bucket yourself, and set image_tag."
+  type        = bool
+  default     = true
+}
+
+variable "image_tag" {
+  description = "Container image tag to deploy. Empty = auto-derive from git (12-char commit SHA, +dirty hash for uncommitted changes) and build/push during apply. Set explicitly (usually with auto_deploy_images=false) to point at a tag pushed out-of-band."
+  type        = string
+  default     = ""
+}
+
 # --- Serving layer (backend / frontend / auth modules, Phase 3) -------------
 
 variable "alb_certificate_arn" {

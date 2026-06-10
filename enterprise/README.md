@@ -12,9 +12,10 @@ set your variables, and apply the Terraform.
 > backend, frontend, auth) are authored and **apply-tested on a live AWS account
 > (us-east-1, 2026-05-29)** — backend healthy behind ALB + CloudFront and Aurora,
 > and the Batch scale-from-zero Ghidra path verified end-to-end (see PLAN.md §0).
-> The local docker-compose deploy is unchanged (suite green). Still **manual**:
-> image build/push to ECR + SPA sync to S3 + CloudFront invalidation (Phase 4
-> CI hook), and the optional custom domain / ALB-Cognito enforcement.
+> The local docker-compose deploy is unchanged (suite green). `terraform apply`
+> now also **builds + pushes the image to both ECR repos and publishes the SPA**
+> (S3 sync + CloudFront invalidation). Still pending: optional custom domain /
+> ALB-Cognito enforcement and the remaining Phase 4 hardening (PLAN.md §6).
 
 ## Why this exists
 
@@ -35,7 +36,7 @@ for the cloud MVP** and run in a local Wairz install. The architecture leaves
 clean seams to add fuzzing (another Batch queue) and emulation (an on-demand
 EC2 worker) later.
 
-## Quickstart (target UX — not yet functional)
+## Quickstart
 
 ```bash
 git clone <repo> && cd wairz/enterprise/terraform
@@ -45,8 +46,25 @@ terraform init
 terraform apply
 ```
 
-`terraform apply` builds and pushes the container images to ECR, provisions the
-full stack, and outputs the CloudFront URL.
+`terraform apply` builds the backend image once and pushes it to **both** ECR
+repos (the Fargate backend and the Batch Ghidra worker share an identical
+image), publishes the SPA to S3 + invalidates CloudFront, provisions the full
+stack, and outputs the CloudFront URL (`app_url`).
+
+**Prerequisites on the machine running Terraform:** Docker (with `buildx`),
+Node/npm, and an authenticated AWS CLI. The image tag is derived from git
+(commit SHA; a content hash is appended for uncommitted edits), so commit before
+applying for a reproducible tag.
+
+> **Cold-start note:** on the very first `apply`, the image push and the ECS
+> service are created concurrently, so the backend may take an extra minute or
+> two to report healthy while the freshly-pushed image is pulled — ECS retries
+> until it lands. Later applies only re-push when the source (tag) changes.
+
+**Building out-of-band (CI):** set `auto_deploy_images = false`, build/push to
+the two ECR repos and sync the SPA bucket yourself, and pass the tag via
+`image_tag`. The `backend_ecr_repository_url`, `ghidra_ecr_repository_url`, and
+`spa_bucket` outputs give you the targets.
 
 ## Layout
 

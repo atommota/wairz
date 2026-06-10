@@ -16,6 +16,17 @@ tags = {
   # Owner = "security-team"
 }
 
+# --- Image & SPA delivery ---------------------------------------------------
+# By default `terraform apply` builds the backend image (pushing it to BOTH the
+# backend and Ghidra ECR repos) and publishes the SPA (S3 sync + CloudFront
+# invalidation). This needs Docker (with buildx), Node/npm, and the AWS CLI on
+# the machine running Terraform. Set false to build/push out-of-band (CI) — then
+# set image_tag to the tag you pushed.
+auto_deploy_images = true
+# Empty = derive the tag from git (commit SHA, +dirty hash for local edits) and
+# build during apply. Pin a tag here when auto_deploy_images = false.
+image_tag = ""
+
 # --- Network ----------------------------------------------------------------
 vpc_cidr = "10.42.0.0/16"
 # false = private egress via VPC endpoints (cheaper at rest); true = NAT gateway.

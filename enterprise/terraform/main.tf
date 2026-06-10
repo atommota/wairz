@@ -74,6 +74,7 @@ module "batch" {
   name       = local.name
   aws_region = var.aws_region
   vpc_id     = module.network.vpc_id
+  image_tag  = local.image_tag
 
   private_subnet_ids = module.network.private_subnet_ids
   max_vcpus          = var.batch_max_vcpus
@@ -92,6 +93,7 @@ module "backend" {
   name       = local.name
   aws_region = var.aws_region
   vpc_id     = module.network.vpc_id
+  image_tag  = local.image_tag
 
   public_subnet_ids  = module.network.public_subnet_ids
   private_subnet_ids = module.network.private_subnet_ids

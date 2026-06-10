@@ -87,6 +87,11 @@ resource "aws_efs_access_point" "ghidra_projects" {
 resource "aws_s3_bucket" "spa" {
   bucket_prefix = "${var.name}-spa-"
   tags          = { Name = "${var.name}-spa" }
+
+  # The SPA bundle is published into this bucket (terraform-managed, derived
+  # artifacts — not user data). Let `terraform destroy` empty it; without this,
+  # teardown fails with BucketNotEmpty once the SPA has been synced.
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "spa" {
