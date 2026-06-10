@@ -86,6 +86,27 @@ def register_reporting_tools(registry: ToolRegistry) -> None:
     )
 
     registry.register(
+        name="get_finding",
+        description=(
+            "Read the full details of a single recorded finding by its ID, including "
+            "description, evidence, affected file/line, CVE/CWE identifiers, status, "
+            "source, and timestamps. Use this to review the complete record of a past "
+            "finding (list_findings only returns one-line summaries)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "finding_id": {
+                    "type": "string",
+                    "description": "UUID of the finding to read",
+                },
+            },
+            "required": ["finding_id"],
+        },
+        handler=_handle_get_finding,
+    )
+
+    registry.register(
         name="update_finding",
         description=(
             "Update an existing finding's severity, status, or details. "
@@ -163,6 +184,47 @@ async def _handle_list_findings(input: dict, context: ToolContext) -> str:
         lines.append(
             f"- [{f.severity.upper()}] {f.title}{file_info} {status_badge} (ID: {f.id})"
         )
+    return "\n".join(lines)
+
+
+async def _handle_get_finding(input: dict, context: ToolContext) -> str:
+    import uuid
+
+    svc = FindingService(context.db)
+    try:
+        finding_id = uuid.UUID(input["finding_id"])
+    except (ValueError, KeyError):
+        return f"Error: '{input.get('finding_id')}' is not a valid finding ID."
+
+    finding = await svc.get(finding_id)
+    if not finding or finding.project_id != context.project_id:
+        return f"Error: Finding {input['finding_id']} not found in this project."
+
+    lines = [
+        f"# {finding.title}",
+        f"- ID: {finding.id}",
+        f"- Severity: {finding.severity}",
+        f"- Status: {finding.status}",
+        f"- Source: {finding.source}",
+    ]
+    if finding.file_path:
+        loc = finding.file_path
+        if finding.line_number is not None:
+            loc += f":{finding.line_number}"
+        lines.append(f"- Location: {loc}")
+    if finding.cve_ids:
+        lines.append(f"- CVEs: {', '.join(finding.cve_ids)}")
+    if finding.cwe_ids:
+        lines.append(f"- CWEs: {', '.join(finding.cwe_ids)}")
+    lines.append(f"- Created: {finding.created_at}")
+    lines.append(f"- Updated: {finding.updated_at}")
+    lines.append("")
+    lines.append("## Description")
+    lines.append(finding.description or "(none)")
+    lines.append("")
+    lines.append("## Evidence")
+    lines.append(finding.evidence or "(none)")
+
     return "\n".join(lines)
 
 
