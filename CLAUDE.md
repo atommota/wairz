@@ -203,7 +203,7 @@ Tools that take a `binary_path` / `path` argument and call `context.resolve_path
 | Fuzzing | `tools/fuzzing.py` | `analyze_fuzzing_target`, `generate_fuzzing_dictionary`, `generate_seed_corpus`, `generate_fuzzing_harness`, `start_fuzzing_campaign`, `check_fuzzing_status`, `stop_fuzzing_campaign`, `triage_fuzzing_crash`, `diagnose_fuzzing_campaign` |
 | Comparison | `tools/comparison.py` | `list_firmware_versions`, `diff_firmware`, `diff_binary`, `diff_decompilation` |
 | UART | `tools/uart.py` | `uart_connect`, `uart_send_command`, `uart_read`, `uart_send_break`, `uart_send_raw`, `uart_disconnect`, `uart_status`, `uart_get_transcript` |
-| Reporting | `tools/reporting.py` | `add_finding`, `list_findings`, `update_finding`, `read_project_instructions`, `list_project_documents`, `read_project_document` |
+| Reporting | `tools/reporting.py` | `add_finding`, `list_findings`, `get_finding`, `update_finding`, `read_project_instructions`, `list_project_documents`, `read_project_document` |
 | Code | `tools/documents.py` | `save_code_cleanup` |
 | RTOS *(applies_to=`("rtos",)`)* | `tools/rtos.py` | `detect_rtos_kernel`, `enumerate_rtos_tasks`, `analyze_vector_table`, `recover_base_address`, `analyze_memory_map` |
 
