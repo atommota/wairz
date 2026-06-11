@@ -488,9 +488,28 @@ CloudFront invalidation). No more manual ECR push / S3 sync.
   both repos live inside their modules (repo→push→service would cycle).
 - **Remaining Phase 4 (below) untouched.**
 
+**4b — Migration-on-boot race guard (fact #11). ✅ DONE + live-tested 2026-06-11.**
+Chose the **startup advisory lock** over a one-off ECS migration task: it also
+covers *autoscale-up* races at any time (not just first apply) and adds no
+apply-time DB/image ordering dependency. `backend/alembic/env.py`
+`do_run_migrations` now takes a PostgreSQL session-level lock
+(`pg_advisory_lock(MIGRATION_LOCK_KEY)`) before migrating and releases it in
+`finally` (also auto-released on disconnect, so a crashed migrator never wedges
+it). The implicit txn the acquire opens is committed before alembic begins its
+own transaction; the session lock survives the commit. First booting task
+migrates; concurrent tasks block then run a no-op `upgrade head`. Transparent
+for a single local migrator (instant acquire) — docker-compose path unchanged.
+- **Local proof (real Postgres):** holding the lock externally made a concurrent
+  `alembic upgrade head` block ~7s, then proceed the instant it released.
+- **Live proof (Aurora, acct 767303321530, 2026-06-11):** applied with
+  `desired_count=2` (test-only) so two backend tasks booted at once. Task A won
+  the lock and ran the full 26-migration chain on the fresh DB; task B blocked,
+  then logged **zero `Running upgrade` lines** (DB already at head) and went
+  straight to uvicorn. Both reached ALB-healthy 2/2; SPA 200, `/api/v1/projects`
+  200 `[]` via CloudFront and ALB. Torn down clean. (`desired_count=2` reverted;
+  default floor stays 1.)
+
 Remaining hardening:
-- Migration-on-boot race guard (fact #11): run alembic as a one-off ECS task in
-  the apply, or a startup advisory lock.
 - CloudWatch logs/dashboards, Batch `maxvCpus` ceiling (cost guardrail),
   per-user job concurrency cap (shared-instance fairness).
 - Cold-start mitigation: ECR pull-through cache / slim image; document the
