@@ -14,7 +14,11 @@ from elftools.elf.sections import SymbolTableSection
 from app.ai.tool_registry import ToolContext, ToolRegistry
 from app.config import get_settings
 from app.services.analysis_service import check_binary_protections
-from app.services.compute_dispatch import describe_batch_job_state, get_dispatcher
+from app.services.compute_dispatch import (
+    ConcurrencyLimitError,
+    describe_batch_job_state,
+    get_dispatcher,
+)
 from app.services.ghidra_service import (
     decompile_function,
     get_analysis_cache,
@@ -1400,9 +1404,12 @@ async def _handle_start_binary_analysis(
     # spawns a detached worker subprocess on this host; other backends (e.g.
     # aws_batch) submit the same worker as a remote job. Either way the worker
     # writes its result to the cache rows the status tool polls.
-    handle = get_dispatcher().dispatch_analysis(
-        context.firmware_id, path, sha256,
-    )
+    try:
+        handle = get_dispatcher().dispatch_analysis(
+            context.firmware_id, path, sha256,
+        )
+    except ConcurrencyLimitError as exc:
+        return f"rejected - {exc}"
 
     await cache.mark_run_started(
         context.firmware_id, path, sha256, handle.pid, context.db,
@@ -1524,9 +1531,12 @@ async def _handle_start_function_decompile(
             f"Poll check_function_decompile_status."
         )
 
-    handle = get_dispatcher().dispatch_decompile(
-        context.firmware_id, path, sha256, function_name,
-    )
+    try:
+        handle = get_dispatcher().dispatch_decompile(
+            context.firmware_id, path, sha256, function_name,
+        )
+    except ConcurrencyLimitError as exc:
+        return f"rejected - {exc}"
 
     await cache.mark_function_run_started(
         context.firmware_id, path, sha256, function_name, handle.pid,

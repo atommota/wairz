@@ -109,8 +109,9 @@ module "backend" {
   batch_job_definition_arn  = module.batch.import_job_definition_arn
   batch_job_definition_name = module.batch.import_job_definition_name
 
-  max_upload_size_mb = var.max_upload_size_mb
-  certificate_arn    = var.alb_certificate_arn
+  max_upload_size_mb          = var.max_upload_size_mb
+  certificate_arn             = var.alb_certificate_arn
+  batch_max_jobs_per_firmware = var.batch_max_jobs_per_firmware
 }
 
 module "frontend" {

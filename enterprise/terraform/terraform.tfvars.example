@@ -55,6 +55,9 @@ aurora_max_capacity = 4
 # --- Heavy compute (AWS Batch — Ghidra) -------------------------------------
 # Ceiling on concurrent Batch vCPUs. Cost guardrail against runaway decompiles.
 batch_max_vcpus = 16
+# Per-firmware in-flight Batch job cap (shared-instance fairness): bounds a
+# runaway agent so one analyst's firmware can't saturate the queue. 0 disables.
+batch_max_jobs_per_firmware = 8
 # Spot is safe here: Ghidra results are cached by binary hash, so an
 # interrupted job simply re-runs. Set false to guarantee completion at higher cost.
 batch_use_spot = true

@@ -77,6 +77,12 @@ variable "max_upload_size_mb" {
   description = "Max upload size (plumbs to the app + should match ALB/CloudFront)."
 }
 
+variable "batch_max_jobs_per_firmware" {
+  type        = number
+  default     = 8
+  description = "Per-firmware in-flight Batch job cap enforced by the backend at SubmitJob (shared-instance fairness). 0 disables."
+}
+
 variable "allowed_hosts" {
   type        = string
   default     = "*"

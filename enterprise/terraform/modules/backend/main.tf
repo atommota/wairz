@@ -184,6 +184,7 @@ resource "aws_ecs_task_definition" "this" {
       { name = "REDIS_URL", value = var.redis_url },
       { name = "BATCH_JOB_QUEUE", value = var.batch_job_queue },
       { name = "BATCH_JOB_DEFINITION", value = var.batch_job_definition_name },
+      { name = "BATCH_MAX_JOBS_PER_FIRMWARE", value = tostring(var.batch_max_jobs_per_firmware) },
       { name = "MAX_UPLOAD_SIZE_MB", value = tostring(var.max_upload_size_mb) },
       # Host/origin guard: behind CloudFront/ALB (+ Cognito) the Host varies, so
       # default to permissive. Tighten to the specific CloudFront/custom domain

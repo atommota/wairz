@@ -77,6 +77,14 @@ class Settings(BaseSettings):
     aws_region: str = ""
     batch_job_queue: str = ""
     batch_job_definition: str = ""
+    # Max in-flight Batch jobs per firmware (aws_batch mode). Shared-instance
+    # fairness guardrail: bounds a runaway agent looping start_binary_analysis /
+    # start_function_decompile so one analyst's firmware can't saturate the queue
+    # under batch_max_vcpus. A firmware belongs to one project/analyst, so this is
+    # the per-project/per-user cap realized on the one identity available at every
+    # dispatch site (per-user proper needs the deferred ALB-Cognito identity). 0
+    # disables the cap. No effect in local mode.
+    batch_max_jobs_per_firmware: int = 8
     # TTL (seconds) for the distributed analysis lock used when compute_backend
     # != "local" (no shared filesystem for flock). Auto-renewed while held, so
     # this only bounds how long a crashed holder blocks others.

@@ -509,9 +509,28 @@ for a single local migrator (instant acquire) — docker-compose path unchanged.
   200 `[]` via CloudFront and ALB. Torn down clean. (`desired_count=2` reverted;
   default floor stays 1.)
 
+**4c — Per-firmware Batch concurrency cap. ✅ DONE 2026-06-11.** Shared-instance
+fairness guardrail (§7): the backend rejects a Ghidra dispatch when the target
+firmware already has `batch_max_jobs_per_firmware` (default 8) jobs in flight,
+bounding a runaway agent so one analyst's firmware can't saturate the queue
+under `batch_max_vcpus`. Enforced in `BatchDispatcher` (cloud path only — local
+subprocess mode untouched): `_enforce_firmware_cap` counts active jobs by
+`JOB_NAME` prefix (`wairz-<fw12>-*`) across all active statuses via `list_jobs`
+(authoritative queue count, no drifting local counter), and raises
+`ConcurrencyLimitError` *before* submit/mark-started (no phantom 'running' row);
+the MCP tools surface it as `rejected - …`. Jobs are tagged `wairz:firmware` for
+console/cost visibility. **Key = firmware** (the one identity available at every
+dispatch site, incl. `ghidra_service.ensure_analysis` which only has
+`firmware_id`); a firmware belongs to one project/analyst, so this realizes the
+per-project/per-user fairness goal. A stricter per-*user* cap needs the
+authenticated identity from the deferred ALB-Cognito work. Plumbed end-to-end:
+`config.batch_max_jobs_per_firmware` → `BATCH_MAX_JOBS_PER_FIRMWARE` env →
+backend module → root `batch_max_jobs_per_firmware` var + tfvars.example.
+`batch:ListJobs` was already in the task role. 6 unit tests
+(`tests/test_compute_dispatch.py`, fake Batch client); suite green.
+
 Remaining hardening:
-- CloudWatch logs/dashboards, Batch `maxvCpus` ceiling (cost guardrail),
-  per-user job concurrency cap (shared-instance fairness).
+- CloudWatch logs/dashboards, Batch `maxvCpus` ceiling (cost guardrail).
 - Cold-start mitigation: ECR pull-through cache / slim image; document the
   ~1–3 min first-decompile latency and the `minvCpus=1` tradeoff.
 - Optional: slim backend image (fact #9).
@@ -526,9 +545,12 @@ This is a **multi-user** deployment (Cognito-fronted). Therefore:
 - Backend is stateless and autoscaled (1..N) — all state in Aurora/Redis/EFS.
 - The MCP empty-state + `switch_project` model already supports many users on
   one server; preserve it.
-- **Per-user / per-project job concurrency cap** at the `SubmitJob` site so one
-  analyst can't saturate the Batch queue. Tag jobs with user + project.
-- **Batch `maxvCpus` ceiling** so a runaway agent can't spin unbounded Spot.
+- **Job concurrency cap** at the `SubmitJob` site so one analyst can't saturate
+  the Batch queue — ✅ DONE as a **per-firmware** cap (§4c), the identity
+  available at every dispatch site; jobs tagged `wairz:firmware`. Per-*user*
+  proper awaits the deferred ALB-Cognito identity.
+- **Batch `maxvCpus` ceiling** so a runaway agent can't spin unbounded Spot —
+  present (`batch_max_vcpus`, default 16).
 
 ---
 

@@ -107,6 +107,12 @@ variable "batch_max_vcpus" {
   default     = 16
 }
 
+variable "batch_max_jobs_per_firmware" {
+  description = "Max in-flight Batch jobs per firmware (shared-instance fairness). Bounds a runaway agent so one analyst's firmware can't saturate the queue under batch_max_vcpus. 0 disables."
+  type        = number
+  default     = 8
+}
+
 variable "batch_use_spot" {
   description = "Run Ghidra Batch jobs on Spot (cheaper; jobs are idempotent so interruptions are safe)."
   type        = bool

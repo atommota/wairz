@@ -34,6 +34,28 @@ def _job_name(prefix: str, *parts: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _firmware_token(firmware_id: uuid.UUID) -> str:
+    """Short, name-safe token identifying a firmware in Batch job names.
+
+    Per-firmware jobs are named ``wairz-<token>-<kind>-<digest>`` so the queue
+    can be counted per firmware via a ``JOB_NAME`` prefix filter (the cap).
+    """
+    return firmware_id.hex[:12]
+
+
+class ConcurrencyLimitError(RuntimeError):
+    """A firmware is already at its in-flight Batch-job cap.
+
+    Subclasses RuntimeError so existing tool error handling surfaces the
+    (descriptive) message; raised *before* any job is submitted or marked
+    started, so it never leaves a phantom 'running' cache row.
+    """
+
+
+# Batch job statuses that still consume (or are about to consume) queue/compute.
+_ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
+
+
 @dataclass
 class JobHandle:
     """Reference to a dispatched analysis job.
@@ -130,29 +152,77 @@ class BatchDispatcher(ComputeDispatcher):
         region = get_settings().aws_region or None
         return boto3.client("batch", region_name=region)
 
-    def _submit(self, job_name: str, command: list[str]) -> JobHandle:
+    def _submit(
+        self, job_name: str, command: list[str], tags: dict[str, str] | None = None,
+    ) -> JobHandle:
         settings = get_settings()
-        resp = self._client().submit_job(
+        kwargs = dict(
             jobName=job_name,
             jobQueue=settings.batch_job_queue,
             jobDefinition=settings.batch_job_definition,
             containerOverrides={"command": command},
         )
+        if tags:
+            kwargs["tags"] = tags
+        resp = self._client().submit_job(**kwargs)
         job_id = resp["jobId"]
         logger.info("Submitted Batch job %s (%s)", job_id, job_name)
         return JobHandle(ref=job_id)
 
+    def _count_active_jobs(self, firmware_token: str) -> int:
+        """Count this firmware's in-flight jobs across all active statuses.
+
+        Authoritative source is the queue itself (not a local counter that drifts
+        when jobs finish out-of-band). Matches on the ``wairz-<token>-`` job-name
+        prefix; paginates each status."""
+        client = self._client()
+        queue = get_settings().batch_job_queue
+        name_filter = [{"name": "JOB_NAME", "values": [f"wairz-{firmware_token}-*"]}]
+        total = 0
+        for status in _ACTIVE_BATCH_STATUSES:
+            next_token = None
+            while True:
+                kwargs = {"jobQueue": queue, "jobStatus": status, "filters": name_filter}
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = client.list_jobs(**kwargs)
+                total += len(resp.get("jobSummaryList", []))
+                next_token = resp.get("nextToken")
+                if not next_token:
+                    break
+        return total
+
+    def _enforce_firmware_cap(self, firmware_id: uuid.UUID) -> None:
+        """Reject a dispatch when this firmware already has too many jobs running.
+
+        Best-effort guardrail (a small TOCTOU window between count and submit is
+        fine — batch_max_vcpus is the hard backstop). Disabled when the cap is 0."""
+        cap = get_settings().batch_max_jobs_per_firmware
+        if cap <= 0:
+            return
+        token = _firmware_token(firmware_id)
+        active = self._count_active_jobs(token)
+        if active >= cap:
+            raise ConcurrencyLimitError(
+                f"firmware {token} already has {active} Batch job(s) in flight "
+                f"(cap {cap}). Wait for one to finish before starting another, "
+                f"or raise batch_max_jobs_per_firmware."
+            )
+
     def dispatch_analysis(
         self, firmware_id: uuid.UUID, binary_path: str, sha256: str,
     ) -> JobHandle:
+        self._enforce_firmware_cap(firmware_id)
+        token = _firmware_token(firmware_id)
         return self._submit(
-            _job_name("wairz-an", sha256),
+            _job_name(f"wairz-{token}-an", sha256),
             [
                 "python", "-m", "app.workers.run_ghidra_analysis",
                 "--firmware-id", str(firmware_id),
                 "--binary-path", binary_path,
                 "--sha256", sha256,
             ],
+            tags={"wairz:firmware": str(firmware_id)},
         )
 
     def dispatch_decompile(
@@ -162,8 +232,10 @@ class BatchDispatcher(ComputeDispatcher):
         sha256: str,
         function_name: str,
     ) -> JobHandle:
+        self._enforce_firmware_cap(firmware_id)
+        token = _firmware_token(firmware_id)
         return self._submit(
-            _job_name("wairz-dec", sha256, function_name),
+            _job_name(f"wairz-{token}-dec", sha256, function_name),
             [
                 "python", "-m", "app.workers.run_function_decompile",
                 "--firmware-id", str(firmware_id),
@@ -171,6 +243,7 @@ class BatchDispatcher(ComputeDispatcher):
                 "--sha256", sha256,
                 "--function-name", function_name,
             ],
+            tags={"wairz:firmware": str(firmware_id)},
         )
 
     def dispatch_reuse_worker(self, idle_ttl_seconds: int) -> JobHandle:
