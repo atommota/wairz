@@ -529,13 +529,47 @@ backend module → root `batch_max_jobs_per_firmware` var + tfvars.example.
 `batch:ListJobs` was already in the task role. 6 unit tests
 (`tests/test_compute_dispatch.py`, fake Batch client); suite green.
 
-Remaining hardening:
-- CloudWatch logs/dashboards, Batch `maxvCpus` ceiling (cost guardrail).
-- Cold-start mitigation: ECR pull-through cache / slim image; document the
-  ~1–3 min first-decompile latency and the `minvCpus=1` tradeoff.
-- Optional: slim backend image (fact #9).
-- **DoD:** documented runbook in `docs/`, cost estimate, teardown verified
-  (`terraform destroy` leaves nothing billable).
+**4d — CloudWatch observability. ✅ DONE 2026-06-11.** New `modules/observability`:
+an SNS alarm topic (optional `alarm_email` subscription), 8 alarms — ECS CPU +
+no-running-tasks (ContainerInsights `RunningTaskCount`), ALB unhealthy-hosts /
+target-5XX / latency, Aurora CPU, Redis memory, and a backend-log
+`ERROR/CRITICAL/Traceback` metric-filter error-rate alarm — plus a single
+dashboard (ECS CPU/mem + tasks, ALB requests/5xx/latency/healthy-hosts, Aurora
+CPU/ACU/connections, Redis CPU/mem/connections). Wired from new module outputs
+(ALB+TG arn_suffix, Aurora `cluster_identifier`, Redis member `cache_cluster_id`,
+backend log group). Root `alarm_email` var + `dashboard_name`/`alarm_topic_arn`
+outputs. Batch has no native CloudWatch metrics → observed via its job log group,
+documented, not alarmed. `terraform validate` + `plan` clean (92 resources, +11).
+
+**4e — Slim backend image (fact #9). ✅ DONE + locally validated 2026-06-11.**
+`backend/Dockerfile` is now multi-stage with two runnable targets sharing a
+`base` stage: **`backend`** (slim, no Ghidra/JDK — the Fargate serving image,
+which dispatches Ghidra to Batch and never runs it) and **`ghidra`** (full;
+the DEFAULT/last stage, so a bare `docker build`/docker-compose and the Batch
+worker get Ghidra unchanged). `build-and-push-backend.sh` now builds
+`--target backend` → backend repo and `--target ghidra` → ghidra repo (the
+shared `base` is cached between them) — replacing 4a's build-once-push-twice.
+**Measured: slim 1.35 GB vs full 3.07 GB (−1.72 GB, −56%)** → much faster ECS
+cold-start pulls. Validated: both targets build; slim has no `/opt/ghidra`,
+imports `app.main` under `COMPUTE_BACKEND=aws_batch`, keeps the extraction
+toolchain (binwalk/sasquatch/7z) for unpack; default (no-target) build still has
+Ghidra + `analyzeHeadless` (compose path unchanged).
+
+**4f — Runbook + cost estimate (DoD). ✅ DONE 2026-06-11.** `docs/RUNBOOK.md`
+(prereqs, deploy incl. the 4a/4e build automation, first-user creation, operate,
+troubleshoot table, teardown incl. the BucketNotEmpty recovery) and
+`docs/COST.md`. Cost finding: the early ~$35–75/mo figure under-counted — the **8
+interface VPC endpoints dominate at-rest (~$117/mo, billed per-AZ × 2)** and
+always-warm Aurora is ~$45, so defaults are **~$220/mo at rest**; documented
+levers (`create_nat_gateway=true` −~$84, `aurora_min_capacity=0` −~$45) reach
+~$90/mo. Batch stays usage-based (~$0.01–0.10/job, $0 at rest). Cold-start
+(~1–3 min first decompile from Batch scale-from-0) documented in the runbook.
+Teardown verified clean in the 4b apply (81 destroyed, nothing billable left).
+
+**Phase 4 is complete** (4a image/SPA delivery, 4b migration guard, 4c
+concurrency cap, 4d observability, 4e slim image, 4f docs). Custom domain +
+ALB-level Cognito enforcement remains intentionally **deferred** (needs the real
+DNS zone + ACM); the HTTPS listener + auth seam is already in the backend module.
 
 ---
 

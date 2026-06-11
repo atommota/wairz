@@ -9,13 +9,16 @@ It is a self-contained deployment target. Clone the repo, `cd enterprise`,
 set your variables, and apply the Terraform.
 
 > **Status:** all Terraform modules (network, storage, database, cache, batch,
-> backend, frontend, auth) are authored and **apply-tested on a live AWS account
-> (us-east-1, 2026-05-29)** — backend healthy behind ALB + CloudFront and Aurora,
-> and the Batch scale-from-zero Ghidra path verified end-to-end (see PLAN.md §0).
-> The local docker-compose deploy is unchanged (suite green). `terraform apply`
-> now also **builds + pushes the image to both ECR repos and publishes the SPA**
-> (S3 sync + CloudFront invalidation). Still pending: optional custom domain /
-> ALB-Cognito enforcement and the remaining Phase 4 hardening (PLAN.md §6).
+> backend, frontend, auth, observability) are authored and **apply-tested on a
+> live AWS account** — backend healthy behind ALB + CloudFront and Aurora, and
+> the Batch scale-from-zero Ghidra path verified end-to-end (see PLAN.md §0). The
+> local docker-compose deploy is unchanged (suite green). **Phase 4 is complete:**
+> `terraform apply` builds + pushes both backend images and publishes the SPA;
+> migrations are advisory-lock-guarded; a per-firmware Batch concurrency cap and
+> CloudWatch alarms/dashboard are in place; the Fargate image is slimmed (no
+> Ghidra); and `docs/RUNBOOK.md` + `docs/COST.md` document operations and cost.
+> Custom domain / ALB-level Cognito enforcement is intentionally deferred (needs
+> a real DNS zone + ACM); the seam is in the backend module.
 
 ## Why this exists
 
@@ -46,10 +49,12 @@ terraform init
 terraform apply
 ```
 
-`terraform apply` builds the backend image once and pushes it to **both** ECR
-repos (the Fargate backend and the Batch Ghidra worker share an identical
-image), publishes the SPA to S3 + invalidates CloudFront, provisions the full
-stack, and outputs the CloudFront URL (`app_url`).
+`terraform apply` builds **two** backend image variants — a slim serving image
+(no Ghidra) for the Fargate backend and the full image for the Batch Ghidra
+worker — and pushes each to its ECR repo, publishes the SPA to S3 + invalidates
+CloudFront, provisions the full stack, and outputs the CloudFront URL
+(`app_url`). See [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) and
+[`docs/COST.md`](./docs/COST.md).
 
 **Prerequisites on the machine running Terraform:** Docker (with `buildx`),
 Node/npm, and an authenticated AWS CLI. The image tag is derived from git
@@ -85,7 +90,8 @@ enterprise/
         ├── backend/     # ECR, ECS Fargate service, ALB
         ├── frontend/    # S3 + CloudFront for the SPA
         ├── batch/       # AWS Batch compute env + Ghidra job queue/definition
-        └── auth/        # Cognito (shared multi-user instance)
+        ├── auth/        # Cognito (shared multi-user instance)
+        └── observability/ # CloudWatch alarms + dashboard + SNS alarm topic
 ```
 
 ## Relationship to the main app
