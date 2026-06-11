@@ -23,3 +23,18 @@ output "service_name" {
 output "service_security_group_id" {
   value = aws_security_group.service.id
 }
+
+# CloudWatch dimensions / log source for the observability module.
+output "alb_arn_suffix" {
+  description = "ALB ARN suffix (CloudWatch LoadBalancer dimension)."
+  value       = aws_lb.this.arn_suffix
+}
+
+output "target_group_arn_suffix" {
+  description = "Target group ARN suffix (CloudWatch TargetGroup dimension)."
+  value       = aws_lb_target_group.this.arn_suffix
+}
+
+output "log_group_name" {
+  value = aws_cloudwatch_log_group.backend.name
+}

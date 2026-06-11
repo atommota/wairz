@@ -14,3 +14,8 @@ output "database_url_secret_arn" {
 output "security_group_id" {
   value = aws_security_group.db.id
 }
+
+output "cluster_identifier" {
+  description = "Aurora cluster id (CloudWatch DBClusterIdentifier dimension)."
+  value       = aws_rds_cluster.this.cluster_identifier
+}

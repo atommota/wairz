@@ -76,6 +76,17 @@ output "cognito_hosted_ui_domain" {
   value = module.auth.hosted_ui_domain
 }
 
+# --- Phase 4: observability -------------------------------------------------
+output "dashboard_name" {
+  description = "CloudWatch dashboard (Console → CloudWatch → Dashboards, in aws_region)."
+  value       = module.observability.dashboard_name
+}
+
+output "alarm_topic_arn" {
+  description = "SNS topic CloudWatch alarms publish to."
+  value       = module.observability.alarm_topic_arn
+}
+
 # output "app_url" {
 #   description = "CloudFront URL serving the Wairz SPA."
 #   value       = module.frontend.cloudfront_domain

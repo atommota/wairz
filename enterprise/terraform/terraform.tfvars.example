@@ -42,6 +42,12 @@ alb_certificate_arn = ""
 # Cognito hosted-UI domain suffix; the full prefix must be globally unique.
 cognito_domain_suffix = "auth"
 
+# --- Observability ----------------------------------------------------------
+# CloudWatch alarms (ECS/ALB/Aurora/Redis health + backend error rate) publish
+# to an SNS topic and a dashboard named after name_prefix-environment is created.
+# Set an email to receive alarm notifications (confirm via the AWS email).
+alarm_email = ""
+
 # --- Application ------------------------------------------------------------
 # Max firmware upload size (MB). Plumbs to backend + ALB + CloudFront limits.
 max_upload_size_mb = 500

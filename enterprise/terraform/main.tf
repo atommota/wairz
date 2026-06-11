@@ -131,3 +131,19 @@ module "auth" {
   callback_urls = ["https://${module.frontend.cloudfront_domain}/oauth2/idpresponse"]
   logout_urls   = ["https://${module.frontend.cloudfront_domain}/"]
 }
+
+module "observability" {
+  source      = "./modules/observability"
+  name        = local.name
+  aws_region  = var.aws_region
+  alarm_email = var.alarm_email
+
+  ecs_cluster_name        = module.backend.cluster_name
+  ecs_service_name        = module.backend.service_name
+  alb_arn_suffix          = module.backend.alb_arn_suffix
+  target_group_arn_suffix = module.backend.target_group_arn_suffix
+  backend_log_group_name  = module.backend.log_group_name
+
+  aurora_cluster_identifier = module.database.cluster_identifier
+  redis_cache_cluster_id    = module.cache.cache_cluster_id
+}

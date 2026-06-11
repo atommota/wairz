@@ -77,6 +77,12 @@ variable "cognito_domain_suffix" {
   default     = "auth"
 }
 
+variable "alarm_email" {
+  description = "If set, subscribes this address to the CloudWatch alarm SNS topic (confirm via the email AWS sends). Empty = alarms still fire to the topic; no email subscription."
+  type        = string
+  default     = ""
+}
+
 # --- Application sizing / behavior knobs ------------------------------------
 
 variable "max_upload_size_mb" {
