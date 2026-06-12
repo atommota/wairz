@@ -13,3 +13,8 @@ output "client_id" {
 output "hosted_ui_domain" {
   value = aws_cognito_user_pool_domain.this.domain
 }
+
+output "seeded_user_emails" {
+  description = "Emails seeded into the pool from users.yaml."
+  value       = sort([for u in aws_cognito_user.seed : u.username])
+}

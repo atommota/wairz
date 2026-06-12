@@ -102,6 +102,12 @@ variable "auth_enabled" {
   default     = false
 }
 
+variable "users_file" {
+  description = "Path (relative to the terraform dir, or absolute) to a YAML list of users to seed into the Cognito pool. Each entry: `- email: a@b.com` with optional `name:`. Only used when auth_enabled (Cognito-native users); absent file = seed nothing. See users.yaml.example."
+  type        = string
+  default     = "users.yaml"
+}
+
 # --- Application sizing / behavior knobs ------------------------------------
 
 variable "max_upload_size_mb" {

@@ -32,3 +32,12 @@ variable "identity_providers" {
   default     = ["COGNITO"]
   description = "Cognito-supported IdPs for the app client. Add a federated SAML/OIDC provider name (e.g. an operator's JumpCloud) to put the pool behind external SSO."
 }
+
+variable "users" {
+  type = list(object({
+    email = string
+    name  = optional(string)
+  }))
+  default     = []
+  description = "Users to seed into the pool (parsed from users.yaml by the root module). Each gets a Cognito-generated temporary password emailed as an invite; they set their own on first login. Ignored when federating an external IdP (those users come from the IdP)."
+}

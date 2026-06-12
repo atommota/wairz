@@ -62,9 +62,30 @@ Key outputs:
 > slim backend image (4e) keeps this short. Later applies only re-push when the
 > git tag changes.
 
-### Creating the first user
+### Creating users
 
-Cognito is configured **admin-create-only** (no self sign-up). Create a user:
+Cognito is configured **admin-create-only** (no self sign-up). There is no
+admin UI inside Wairz — accounts are managed by whoever holds AWS access. Two
+ways to add people:
+
+**Declarative (recommended) — `users.yaml`.** Copy `terraform/users.yaml.example`
+to `terraform/users.yaml` and list your roster:
+
+```yaml
+- email: analyst@example.com
+  name: Ana Lyst        # optional
+- email: lead@example.com
+```
+
+`terraform apply` (with `auth_enabled = true`) creates each account in the
+standard invite flow: Cognito generates a temporary password, emails an invite,
+and the user sets their own password (min 12 chars, mixed case + number +
+symbol) on first login — Terraform never holds a password. The file is
+declarative: add an entry to onboard, remove one to delete that account, re-apply
+to sync. `terraform output cognito_seeded_users` lists who's provisioned.
+`users.yaml` is gitignored (it's your roster / PII); only the `.example` ships.
+
+**Imperative (one-off) — CLI.** Equivalent for a single ad-hoc account:
 
 ```bash
 aws cognito-idp admin-create-user \
@@ -72,6 +93,17 @@ aws cognito-idp admin-create-user \
   --username analyst@example.com \
   --user-attributes Name=email,Value=analyst@example.com Name=email_verified,Value=true
 ```
+
+> **Email delivery / scale.** The pool uses Cognito's **default** email sender
+> (~50 emails/day, generic from-address). For a larger rollout wire **SES** into
+> the pool. If an invite never arrives, that cap or spam filtering is the usual
+> cause — you can also set a temporary password inline and share it securely.
+>
+> **Least-privilege onboarding.** To let someone add users *without* full AWS
+> access, grant an IAM policy scoped to `cognito-idp:AdminCreateUser` /
+> `AdminSetUserPassword` / `AdminDisableUser` / `AdminDeleteUser` on this one
+> pool ARN — they can run the CLI form above but touch nothing else. (Editing
+> `users.yaml` requires Terraform/state access, so it's the operator's path.)
 
 ### Custom domain + login (optional, SSO-ready)
 

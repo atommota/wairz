@@ -91,6 +91,11 @@ output "auth_enabled" {
   value       = var.auth_enabled
 }
 
+output "cognito_seeded_users" {
+  description = "Emails seeded into the Cognito pool from users.yaml (each emailed an invite on creation)."
+  value       = module.auth.seeded_user_emails
+}
+
 # --- Phase 4: observability -------------------------------------------------
 output "dashboard_name" {
   description = "CloudWatch dashboard (Console → CloudWatch → Dashboards, in aws_region)."

@@ -59,6 +59,11 @@ route53_zone_id = "" # hosted zone that owns domain_name; required if domain_nam
 # name to the auth module's identity_providers.
 auth_enabled = false
 
+# Optionally seed Cognito accounts declaratively: copy users.yaml.example to
+# users.yaml (gitignored) and list emails. Created on apply when auth_enabled.
+# Path is relative to the terraform dir unless absolute.
+users_file = "users.yaml"
+
 # --- Application ------------------------------------------------------------
 # Max firmware upload size (MB). Plumbs to backend + ALB + CloudFront limits.
 max_upload_size_mb = 500

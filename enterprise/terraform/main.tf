@@ -66,6 +66,14 @@ locals {
     var.domain_name != "" ? "https://${var.domain_name}/" : "",
     "http://localhost:3000/",
   ])
+
+  # Optional declarative user seeding. Parse users.yaml (path relative to the
+  # terraform dir unless absolute) only when auth is on — seeding Cognito users
+  # for a pool nobody logs into would just send stray invite emails.
+  users_file_path = startswith(var.users_file, "/") ? var.users_file : "${path.module}/${var.users_file}"
+  seed_users = (var.auth_enabled && fileexists(local.users_file_path)
+    ? yamldecode(file(local.users_file_path))
+  : [])
 }
 
 # auth_enabled needs a stable redirect domain.
@@ -189,6 +197,7 @@ module "auth" {
   domain_suffix = var.cognito_domain_suffix
   callback_urls = local.app_callback_urls
   logout_urls   = local.app_logout_urls
+  users         = local.seed_users
 }
 
 module "observability" {

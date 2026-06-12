@@ -62,3 +62,32 @@ resource "aws_cognito_user_pool_domain" "this" {
   domain       = "${var.name}-${var.domain_suffix}"
   user_pool_id = aws_cognito_user_pool.this.id
 }
+
+# Seed users declaratively from users.yaml (root module parses the file). Each
+# user is created in the standard admin-invite flow: Cognito generates a
+# temporary password and emails an invite (FORCE_CHANGE_PASSWORD), and the user
+# sets their own password on first login — Terraform never holds a password.
+# Editing users.yaml + re-applying adds/removes accounts; removing a user here
+# deletes the Cognito account. Keyed by email so the set is stable across applies.
+resource "aws_cognito_user" "seed" {
+  for_each = { for u in var.users : lower(u.email) => u }
+
+  user_pool_id = aws_cognito_user_pool.this.id
+  username     = each.value.email
+
+  attributes = merge(
+    {
+      email          = each.value.email
+      email_verified = "true"
+    },
+    each.value.name != null ? { name = each.value.name } : {},
+  )
+
+  desired_delivery_mediums = ["EMAIL"]
+
+  # Don't churn the temporary password on every apply (it's regenerated server
+  # side and not tracked here); leave existing accounts alone once created.
+  lifecycle {
+    ignore_changes = [temporary_password]
+  }
+}
