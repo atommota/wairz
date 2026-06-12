@@ -129,6 +129,46 @@ federation broker. Add a SAML 2.0 or OIDC identity provider to the user pool
 module's `identity_providers`. The SPA login flow is unchanged — the hosted UI
 brokers to your IdP. No app or SPA code change.
 
+### Remote MCP — drive the cloud instance with Claude (optional)
+
+By default the MCP server is **stdio-only**: it talks straight to the database +
+firmware files, so it can only run *inside* the deployment, not from a laptop.
+Set `mcp_http_enabled = true` to run the **Streamable HTTP** MCP transport as a
+sidecar in the backend task and route `/mcp` to it (ALB + CloudFront). Claude
+then connects over HTTPS — no SSH, no VPN.
+
+```hcl
+auth_enabled     = true     # MCP is gated by the same Cognito bearer as the API
+mcp_http_enabled = true
+```
+
+`terraform output mcp_url` gives the endpoint (`https://<domain>/mcp`). It is
+**Cognito-gated**: every request needs a valid access token (no/invalid token →
+401), the *same* token the SPA obtains. Each MCP session gets its own project
+context, so multiple analysts share one instance without colliding.
+
+**Connect Claude Code** (`.mcp.json` / `claude mcp add`):
+
+```jsonc
+{
+  "mcpServers": {
+    "wairz-cloud": {
+      "type": "http",
+      "url": "https://wairz.example.com/mcp",
+      "headers": { "Authorization": "Bearer <cognito-access-token>" }
+    }
+  }
+}
+```
+
+Getting a token: the practical path is to copy the access token the SPA already
+holds after you log in (browser dev-tools → it's the bearer on `/api/*` XHRs),
+or mint one via the Cognito hosted UI / your IdP. Tokens are short-lived
+(~1 h); for a long-running agent, wire a refresh or use a federated IdP session.
+The sidecar runs `wairz-mcp --transport http` from the same image and shares the
+task's EFS + DB + OIDC env; it serves an unauthenticated `/healthz` for the ALB
+check only. `essential=false`, so an MCP fault never takes down the REST API.
+
 ### Out-of-band image/SPA builds (CI)
 
 Set `auto_deploy_images = false` and pass `image_tag = "<tag>"`. Build/push to

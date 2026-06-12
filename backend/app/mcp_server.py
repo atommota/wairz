@@ -1056,13 +1056,16 @@ async def _send_json_asgi(send, status: int, payload: dict) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def build_http_app(path: str = "/mcp"):
+def build_http_app(path: str = "/mcp", health_path: str = "/healthz"):
     """Build the Streamable HTTP ASGI app for the multi-user cloud transport.
 
     Returns a Starlette app that serves the MCP server at *path*. Each MCP
     session gets its own ProjectState (per-session, not per-process). When
     ``settings.auth_enabled`` the endpoint requires a valid bearer token,
     verified by the *same* OIDC/Cognito verifier as the REST API.
+
+    *health_path* serves an unauthenticated 200 for the ALB target-group health
+    check (the MCP endpoint itself never returns a clean 200 to a bare GET).
 
     Runs as its own ASGI app (e.g. ``wairz-mcp --transport http``, served by
     uvicorn) rather than mounted into the FastAPI app — that keeps the MCP
@@ -1127,6 +1130,24 @@ def build_http_app(path: str = "/mcp"):
                 return
         await manager.handle_request(scope, receive, send)
 
+    # Route by exact path in pure ASGI. We deliberately avoid Starlette's
+    # `Mount(path, ...)`, which serves only `<path>/` and 307-redirects the bare
+    # `<path>` to it — over the network the client drops its Authorization header
+    # on that hop (→ 401). Here both `/mcp` and `/mcp/...` hit the transport
+    # directly, no redirect, so clients can use the natural `…/mcp` URL.
+    async def dispatch(scope, receive, send):
+        if scope["type"] != "http":
+            await _send_json_asgi(send, 404, {"detail": "not found"})
+            return
+        req_path = scope.get("path", "")
+        if req_path == health_path:
+            await _send_json_asgi(send, 200, {"status": "ok"})
+            return
+        if req_path == path or req_path.startswith(path.rstrip("/") + "/"):
+            await mcp_asgi(scope, receive, send)
+            return
+        await _send_json_asgi(send, 404, {"detail": "not found"})
+
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         # The session manager's task group must be live for handle_request.
@@ -1134,7 +1155,9 @@ def build_http_app(path: str = "/mcp"):
             logger.info("MCP Streamable HTTP transport ready at %s", path)
             yield
 
-    return Starlette(routes=[Mount(path, app=mcp_asgi)], lifespan=lifespan)
+    # Mount the dispatcher at root so it receives the full request path verbatim
+    # (no prefix stripping, no slash-redirect); Starlette still drives lifespan.
+    return Starlette(routes=[Mount("/", app=dispatch)], lifespan=lifespan)
 
 
 def main() -> None:

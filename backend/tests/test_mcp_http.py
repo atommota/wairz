@@ -134,3 +134,13 @@ def test_http_open_when_auth_disabled(monkeypatch):
     with TestClient(build_http_app()) as client:
         r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
         assert r.status_code != 401
+
+
+def test_health_endpoint_unauthenticated(monkeypatch):
+    # The ALB target-group health check must get a 200 even with auth enabled —
+    # /healthz is outside the auth gate.
+    monkeypatch.setattr(oidc, "get_verifier", _good_verifier)
+    with TestClient(build_http_app()) as client:
+        r = client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"

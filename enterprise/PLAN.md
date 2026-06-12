@@ -608,13 +608,14 @@ OIDC auth). Putting the pool behind a *specific* external IdP (the actual
 JumpCloud/Okta federation config) is the only remaining auth follow-up — the
 seam is in place (`identity_providers`).
 
-### Phase 5 — Remote MCP (cloud-usable AI path) — 🚧 APP LAYER DONE, INFRA PENDING
+### Phase 5 — Remote MCP (cloud-usable AI path) — ✅ DONE + LIVE-VALIDATED
 
-**Status (2026-06-12):** the backend application layer (5a/5b/5c) is **code-complete
-+ unit-tested** (`backend/tests/test_mcp_http.py`, 6 tests; full suite 282 passed,
-the 4 reds are the pre-existing stale `_FakeFirmware`/yaffs fixtures, unchanged by
-this work). **Not yet wired into the cloud (Dockerfile/Terraform/CloudFront) and
-not live-validated.** See "Progress" below.
+**Status (2026-06-12):** app layer (5a/5b/5c) **code-complete + unit-tested**
+(`backend/tests/test_mcp_http.py`, 7 tests) AND infra wired + **live-validated on
+`wairz.digitalandrew.io/mcp` then torn down clean**. The cloud deploy is now
+genuinely usable by Claude over HTTP — `mcp_http_enabled = true` runs the
+Streamable HTTP MCP server as a sidecar and routes `/mcp` to it, Cognito-gated.
+See "Progress" + "Live validation" below.
 
 **The gap.** Phases 1–4 made the *web SPA* cloud-native and Cognito-gated, but
 they did **not** make the **MCP path** — the actual way Claude drives Wairz —
@@ -682,26 +683,36 @@ multi-user. The work is real but contained to 5a–5c.
   through. Off when `auth_enabled` is false (logs a loud warning). Tests cover
   all four cases.
 
-**Remaining (infra + validation):**
+**Infra wiring — DONE (2026-06-12).** All flag-gated behind `mcp_http_enabled`
+(default false; the existing deploy is unchanged unless set):
 
-1. **Package the sidecar** — the slim backend image already contains the code;
-   add a second container to the ECS task definition running `wairz-mcp
-   --transport http` (same env: `DATABASE_URL`, `REDIS_URL`, `STORAGE_ROOT`,
-   `AUTH_ENABLED`, `OIDC_*`), sharing the EFS mount. `modules/backend`.
-2. **Route `/mcp`** — ALB target group + listener rule (or a second ALB) to the
-   sidecar port; CloudFront `ordered_cache_behavior` for `/mcp*` (uncached,
-   all-viewer, methods incl. POST/DELETE) → ALB. `modules/backend`,
-   `modules/frontend`.
-3. **Client auth UX** — confirm Claude Code's remote-MCP connect against a
-   Cognito bearer (static token via `--header`, or wire the hosted-UI OAuth).
-   Decide token-issuance ergonomics for end users. `docs/RUNBOOK.md`.
-4. **Live-validate then tear down** (acceptance below).
+1. **Sidecar** — second container `mcp` in the ECS task def runs `wairz-mcp
+   --transport http` from the *same* image, sharing the EFS mounts + DB/Redis/
+   OIDC env (env DRY'd into a `container_environment` local).
+   `essential=false` so an MCP fault can't take down the REST API.
+   `modules/backend`.
+2. **Routing** — `aws_lb_target_group.mcp` (health-checks the sidecar's
+   unauthenticated `/healthz`) + an ALB listener rule forwarding `/mcp`,`/mcp/*`
+   to it; a second ECS-service `load_balancer` block registers the sidecar.
+   CloudFront `/mcp*` behavior (uncached, all-viewer, `compress=false` for SSE).
+   `modules/backend` + `modules/frontend`. `mcp_url` output.
+3. **Client auth UX** — `docs/RUNBOOK.md` "Remote MCP" section: `.mcp.json`
+   `type:http` + `Authorization: Bearer <cognito-token>`; copy the SPA's token
+   or mint via the hosted UI/IdP.
 
-**Acceptance:** Claude Code connects to `https://<domain>/mcp` with a Cognito
-bearer, `list_projects`/`switch_project`/an analysis tool round-trip, two
-concurrent users hold **independent** active projects, and an unauthenticated
-`/mcp` request is rejected (401/close) — live-validated on the custom domain,
-then torn down. Local stdio MCP + the suite stay unchanged (HTTP path is opt-in).
+**Bug found + fixed during validation:** `Mount("/mcp", …)` serves only `/mcp/`
+and **307-redirects bare `/mcp` → `/mcp/`**; over the network the client drops
+its `Authorization` header on that hop → 401. Fixed by routing in pure ASGI
+(`Mount("/", dispatch)` + exact-path match) so `/mcp` is served directly, no
+redirect — clients use the natural `…/mcp` URL.
+
+**Live validation (2026-06-12, `wairz.digitalandrew.io/mcp`, torn down clean):**
+auth gate (no token → 401, garbage → 401); authenticated `initialize` +
+`list_tools` (67 kind-filtered tools) + `list_projects` (DB reached from the
+sidecar) round-trip with a real Cognito access token; **two concurrent sessions
+independent**. MCP TG `/healthz` healthy; SPA + REST API unaffected.
+
+**Acceptance — met.** Local stdio MCP + the suite stay unchanged (HTTP is opt-in).
 
 > Note the related but distinct **WebSocket** gap: emulation/terminal WS were
 > hardened in the security review (§11) to require a token, but they remain

@@ -124,6 +124,25 @@ variable "log_retention_days" {
   default = 30
 }
 
+# --- Remote MCP sidecar (Phase 5) ------------------------------------------
+variable "mcp_http_enabled" {
+  type        = bool
+  default     = false
+  description = "Run the Streamable HTTP MCP server as a sidecar in the backend task and route /mcp* to it. Lets Claude connect to the cloud instance over HTTP (Cognito-gated) instead of stdio. Off = no MCP sidecar (local/stdio only)."
+}
+
+variable "mcp_container_port" {
+  type        = number
+  default     = 8765
+  description = "Port the MCP sidecar listens on (ALB routes /mcp* here)."
+}
+
+variable "mcp_health_path" {
+  type        = string
+  default     = "/healthz"
+  description = "Unauthenticated health path the MCP sidecar serves for the ALB target-group check."
+}
+
 # --- Wired from other modules ----------------------------------------------
 variable "efs_id" {
   type = string

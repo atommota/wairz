@@ -64,6 +64,10 @@ auth_enabled = false
 # Path is relative to the terraform dir unless absolute.
 users_file = "users.yaml"
 
+# Run the Streamable HTTP MCP server as a sidecar and route /mcp to it, so Claude
+# can drive the cloud instance over HTTP (Cognito-gated) instead of stdio.
+mcp_http_enabled = false
+
 # --- Application ------------------------------------------------------------
 # Max firmware upload size (MB). Plumbs to backend + ALB + CloudFront limits.
 max_upload_size_mb = 500

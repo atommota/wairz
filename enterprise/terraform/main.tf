@@ -176,6 +176,8 @@ module "backend" {
   auth_enabled  = var.auth_enabled
   oidc_issuer   = var.auth_enabled ? local.oidc_issuer : ""
   oidc_audience = var.auth_enabled ? module.auth.client_id : ""
+
+  mcp_http_enabled = var.mcp_http_enabled
 }
 
 module "frontend" {
@@ -189,6 +191,7 @@ module "frontend" {
 
   aliases             = var.domain_name != "" ? [var.domain_name] : []
   acm_certificate_arn = var.domain_name != "" ? aws_acm_certificate_validation.cf[0].certificate_arn : ""
+  mcp_enabled         = var.mcp_http_enabled
 }
 
 module "auth" {

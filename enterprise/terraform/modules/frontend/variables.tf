@@ -40,3 +40,9 @@ variable "acm_certificate_arn" {
   default     = ""
   description = "ACM cert ARN (us-east-1) for custom domains. Empty = use the default *.cloudfront.net cert."
 }
+
+variable "mcp_enabled" {
+  type        = bool
+  default     = false
+  description = "Add an uncached /mcp* CloudFront behavior routing the Streamable HTTP MCP transport to the ALB (Phase 5)."
+}

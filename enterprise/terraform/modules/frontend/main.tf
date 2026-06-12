@@ -101,6 +101,22 @@ resource "aws_cloudfront_distribution" "this" {
     compress                 = true
   }
 
+  # Remote MCP (Phase 5) → ALB, uncached, all methods. compress=false so the
+  # Streamable HTTP SSE responses pass through unbuffered.
+  dynamic "ordered_cache_behavior" {
+    for_each = var.mcp_enabled ? [1] : []
+    content {
+      path_pattern             = "/mcp*"
+      target_origin_id         = local.alb_origin_id
+      viewer_protocol_policy   = "redirect-to-https"
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
+      origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer.id
+      compress                 = false
+    }
+  }
+
   # SPA client-side routing: serve index.html for unknown paths.
   custom_error_response {
     error_code            = 403

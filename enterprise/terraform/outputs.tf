@@ -96,6 +96,11 @@ output "cognito_seeded_users" {
   value       = module.auth.seeded_user_emails
 }
 
+output "mcp_url" {
+  description = "Remote MCP (Streamable HTTP) endpoint, when enabled — connect Claude here with a Cognito bearer."
+  value       = var.mcp_http_enabled ? "${local.app_url}/mcp" : ""
+}
+
 # --- Phase 4: observability -------------------------------------------------
 output "dashboard_name" {
   description = "CloudWatch dashboard (Console → CloudWatch → Dashboards, in aws_region)."

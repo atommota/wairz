@@ -82,6 +82,17 @@ resource "aws_security_group" "service" {
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
+  # MCP sidecar port (Phase 5) — only when the sidecar is enabled.
+  dynamic "ingress" {
+    for_each = var.mcp_http_enabled ? [1] : []
+    content {
+      description     = "MCP sidecar from ALB"
+      from_port       = var.mcp_container_port
+      to_port         = var.mcp_container_port
+      protocol        = "tcp"
+      security_groups = [aws_security_group.alb.id]
+    }
+  }
   egress {
     from_port   = 0
     to_port     = 0
@@ -143,12 +154,155 @@ resource "aws_lb_listener" "https" {
   }
 }
 
+# --- MCP sidecar target group + routing (Phase 5) ---------------------------
+# /mcp* is forwarded to the MCP sidecar container; everything else falls through
+# to the backend (default action). The sidecar serves an unauthenticated health
+# path for the target-group check (the MCP endpoint itself never 200s a bare GET).
+resource "aws_lb_target_group" "mcp" {
+  count       = var.mcp_http_enabled ? 1 : 0
+  name        = "${var.name}-mcp-tg"
+  port        = var.mcp_container_port
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+
+  health_check {
+    path                = var.mcp_health_path
+    matcher             = "200"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 5
+  }
+}
+
+resource "aws_lb_listener_rule" "mcp_http" {
+  count        = var.mcp_http_enabled ? 1 : 0
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 10
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mcp[0].arn
+  }
+  condition {
+    path_pattern {
+      values = ["/mcp", "/mcp/*"]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "mcp_https" {
+  count        = var.mcp_http_enabled && var.certificate_arn != "" ? 1 : 0
+  listener_arn = aws_lb_listener.https[0].arn
+  priority     = 10
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mcp[0].arn
+  }
+  condition {
+    path_pattern {
+      values = ["/mcp", "/mcp/*"]
+    }
+  }
+}
+
 # --- Task definition + service ----------------------------------------------
 locals {
   efs_volumes = {
     firmware        = { ap = var.efs_firmware_access_point_id, path = "/data/firmware" }
     ghidra-projects = { ap = var.efs_ghidra_projects_access_point_id, path = "/data/ghidra_projects" }
   }
+
+  # Shared by the backend container and the MCP sidecar — both talk to the same
+  # DB/Redis/Batch/EFS and need the same OIDC + compute config.
+  container_environment = [
+    { name = "COMPUTE_BACKEND", value = "aws_batch" },
+    { name = "AWS_REGION", value = var.aws_region },
+    { name = "STORAGE_ROOT", value = "/data/firmware" },
+    { name = "GHIDRA_PROJECT_ROOT", value = "/data/ghidra_projects" },
+    { name = "REDIS_URL", value = var.redis_url },
+    { name = "BATCH_JOB_QUEUE", value = var.batch_job_queue },
+    { name = "BATCH_JOB_DEFINITION", value = var.batch_job_definition_name },
+    { name = "BATCH_MAX_JOBS_PER_FIRMWARE", value = tostring(var.batch_max_jobs_per_firmware) },
+    { name = "MAX_UPLOAD_SIZE_MB", value = tostring(var.max_upload_size_mb) },
+    # OIDC auth (no-op unless AUTH_ENABLED=true).
+    { name = "AUTH_ENABLED", value = tostring(var.auth_enabled) },
+    { name = "OIDC_ISSUER", value = var.oidc_issuer },
+    { name = "OIDC_AUDIENCE", value = var.oidc_audience },
+    # Host/origin guard: behind CloudFront/ALB (+ Cognito) the Host varies, so
+    # default to permissive. Tighten to the specific CloudFront/custom domain
+    # in production if you want DNS-rebinding protection at the app layer too.
+    { name = "ALLOWED_HOSTS", value = var.allowed_hosts },
+    { name = "ALLOWED_ORIGINS", value = var.allowed_origins },
+  ]
+
+  container_secrets = [
+    { name = "DATABASE_URL", valueFrom = var.database_url_secret_arn },
+  ]
+
+  container_mount_points = [
+    for k, v in local.efs_volumes : { sourceVolume = k, containerPath = v.path, readOnly = false }
+  ]
+
+  backend_container = {
+    name         = "backend"
+    image        = "${aws_ecr_repository.backend.repository_url}:${var.image_tag}"
+    essential    = true
+    portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
+
+    # Run from the image's prebuilt venv directly. The image's default CMD uses
+    # `uv run`, which re-resolves the project against pypi.org at startup — that
+    # fails in a private subnet with no internet egress (VPC endpoints reach AWS
+    # services only). Invoking the venv binaries avoids any network at boot.
+    command = ["sh", "-c",
+      "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${var.container_port}"
+    ]
+
+    environment = local.container_environment
+    secrets     = local.container_secrets
+    mountPoints = local.container_mount_points
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.backend.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "backend"
+      }
+    }
+  }
+
+  # MCP sidecar (Phase 5): the same image, run as the Streamable HTTP MCP server.
+  # essential=false so an MCP fault can't take down the REST API / migrations;
+  # the venv console script avoids any pypi re-resolution at boot.
+  mcp_container = {
+    name         = "mcp"
+    image        = "${aws_ecr_repository.backend.repository_url}:${var.image_tag}"
+    essential    = false
+    portMappings = [{ containerPort = var.mcp_container_port, protocol = "tcp" }]
+
+    command = ["/app/.venv/bin/wairz-mcp", "--transport", "http",
+      "--host", "0.0.0.0", "--port", tostring(var.mcp_container_port),
+      "--path", "/mcp"
+    ]
+
+    environment = local.container_environment
+    secrets     = local.container_secrets
+    mountPoints = local.container_mount_points
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.backend.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "mcp"
+      }
+    }
+  }
+
+  containers = var.mcp_http_enabled ? [local.backend_container, local.mcp_container] : [local.backend_container]
+
+  service_load_balancers = concat(
+    [{ tg = aws_lb_target_group.this.arn, container = "backend", port = var.container_port }],
+    var.mcp_http_enabled ? [{ tg = aws_lb_target_group.mcp[0].arn, container = "mcp", port = var.mcp_container_port }] : [],
+  )
 }
 
 resource "aws_ecs_task_definition" "this" {
@@ -175,55 +329,7 @@ resource "aws_ecs_task_definition" "this" {
     }
   }
 
-  container_definitions = jsonencode([{
-    name         = "backend"
-    image        = "${aws_ecr_repository.backend.repository_url}:${var.image_tag}"
-    essential    = true
-    portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
-
-    # Run from the image's prebuilt venv directly. The image's default CMD uses
-    # `uv run`, which re-resolves the project against pypi.org at startup — that
-    # fails in a private subnet with no internet egress (VPC endpoints reach AWS
-    # services only). Invoking the venv binaries avoids any network at boot.
-    command = ["sh", "-c",
-      "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${var.container_port}"
-    ]
-
-    environment = [
-      { name = "COMPUTE_BACKEND", value = "aws_batch" },
-      { name = "AWS_REGION", value = var.aws_region },
-      { name = "STORAGE_ROOT", value = "/data/firmware" },
-      { name = "GHIDRA_PROJECT_ROOT", value = "/data/ghidra_projects" },
-      { name = "REDIS_URL", value = var.redis_url },
-      { name = "BATCH_JOB_QUEUE", value = var.batch_job_queue },
-      { name = "BATCH_JOB_DEFINITION", value = var.batch_job_definition_name },
-      { name = "BATCH_MAX_JOBS_PER_FIRMWARE", value = tostring(var.batch_max_jobs_per_firmware) },
-      { name = "MAX_UPLOAD_SIZE_MB", value = tostring(var.max_upload_size_mb) },
-      # OIDC auth (no-op unless AUTH_ENABLED=true).
-      { name = "AUTH_ENABLED", value = tostring(var.auth_enabled) },
-      { name = "OIDC_ISSUER", value = var.oidc_issuer },
-      { name = "OIDC_AUDIENCE", value = var.oidc_audience },
-      # Host/origin guard: behind CloudFront/ALB (+ Cognito) the Host varies, so
-      # default to permissive. Tighten to the specific CloudFront/custom domain
-      # in production if you want DNS-rebinding protection at the app layer too.
-      { name = "ALLOWED_HOSTS", value = var.allowed_hosts },
-      { name = "ALLOWED_ORIGINS", value = var.allowed_origins },
-    ]
-    secrets = [
-      { name = "DATABASE_URL", valueFrom = var.database_url_secret_arn },
-    ]
-    mountPoints = [
-      for k, v in local.efs_volumes : { sourceVolume = k, containerPath = v.path, readOnly = false }
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.backend.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "backend"
-      }
-    }
-  }])
+  container_definitions = jsonencode(local.containers)
 }
 
 resource "aws_ecs_service" "this" {
@@ -240,14 +346,17 @@ resource "aws_ecs_service" "this" {
     assign_public_ip = false
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.this.arn
-    container_name   = "backend"
-    container_port   = var.container_port
+  dynamic "load_balancer" {
+    for_each = local.service_load_balancers
+    content {
+      target_group_arn = load_balancer.value.tg
+      container_name   = load_balancer.value.container
+      container_port   = load_balancer.value.port
+    }
   }
 
   # Migrations run on container start (alembic upgrade head in the image CMD).
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.http, aws_lb_listener_rule.mcp_http]
 }
 
 # --- Autoscaling on CPU -----------------------------------------------------

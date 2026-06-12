@@ -102,6 +102,12 @@ variable "auth_enabled" {
   default     = false
 }
 
+variable "mcp_http_enabled" {
+  description = "Run the Streamable HTTP MCP server as a sidecar in the backend task and route /mcp* (ALB + CloudFront) to it, so Claude can connect to the cloud instance over HTTP instead of stdio (Phase 5). Gated by auth_enabled for the bearer-token check. Off = no MCP sidecar."
+  type        = bool
+  default     = false
+}
+
 variable "users_file" {
   description = "Path (relative to the terraform dir, or absolute) to a YAML list of users to seed into the Cognito pool. Each entry: `- email: a@b.com` with optional `name:`. Only used when auth_enabled (Cognito-native users); absent file = seed nothing. See users.yaml.example."
   type        = string
