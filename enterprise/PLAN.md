@@ -566,10 +566,47 @@ levers (`create_nat_gateway=true` −~$84, `aurora_min_capacity=0` −~$45) reac
 (~1–3 min first decompile from Batch scale-from-0) documented in the runbook.
 Teardown verified clean in the 4b apply (81 destroyed, nothing billable left).
 
+**4g — Custom domain + OIDC auth (SSO-ready). ✅ DONE + live-validated
+2026-06-11.** Optional, flag-gated (`domain_name`/`route53_zone_id`,
+`auth_enabled`; empty = today's open, CloudFront-domain behavior). Chosen
+**app-level OIDC/JWT over ALB `authenticate-cognito`** because the latter does
+302 full-page redirects that fight a SPA's XHR API calls, and app-level is
+IdP-agnostic + needs no topology change (CloudFront stays the front door).
+- **Backend:** `app/auth/oidc.py` — a JWKS-cached RS256 verifier (PyJWT) gating
+  the HTTP API via middleware when `auth_enabled`; off by default so compose +
+  the suite stay open. Audience matched against `aud` *or* (Cognito) `client_id`,
+  so it's IdP-neutral. MCP unaffected (direct service calls); WS (out-of-scope
+  emulation/uart) not gated — documented. 12 unit tests.
+- **Frontend:** runtime `/config.json` (built-once SPA reads OIDC settings at
+  startup; default `authEnabled:false`); `oidc-client-ts` Authorization Code +
+  PKCE login via the Cognito hosted UI; Bearer attached in the axios interceptor;
+  401 → re-login.
+- **Terraform:** `domain.tf` — ACM cert (us-east-1 provider) DNS-validated in the
+  operator's zone + Route53 alias to CloudFront; frontend `aliases`+cert wired.
+  Cognito client switched to a **public PKCE client (no secret)**; callbacks keyed
+  off the input `domain_name` (a localhost dev fallback) to avoid a
+  backend→auth→frontend→backend cycle; `auth_enabled` requires `domain_name`
+  (precondition). Backend gets `AUTH_ENABLED`/`OIDC_ISSUER`/`OIDC_AUDIENCE`;
+  `deploy-spa.sh` emits the real `config.json`.
+- **SSO:** Cognito is the federation broker — an operator adds a SAML/OIDC IdP
+  (JumpCloud/Okta) to the pool and lists it in the auth module's
+  `identity_providers`; the SPA login flow is unchanged. See
+  [[wairz-enterprise-sso-requirement]].
+- **Bug found + fixed live:** the private-subnet backend (no NAT) couldn't reach
+  the Cognito JWKS (`cognito-idp.<region>.amazonaws.com`), so a valid token hung
+  → CloudFront 504. Fix: add a **`cognito-idp` interface VPC endpoint** when auth
+  is on and no NAT (AZ-filtered — the service isn't in every AZ; private DNS still
+  serves the VPC) + a 5 s JWKS-fetch timeout so failures are a fast 401, not 504.
+- **Live-validated on `wairz.digitalandrew.io`:** cert issued, DNS resolved, SPA
+  200 on the custom domain, `config.json` correct, API no-token → 401, garbage
+  token → 401, **real Cognito access token → 200** (JWKS fetched via the
+  endpoint, RS256 + iss + audience validated). Torn down clean.
+
 **Phase 4 is complete** (4a image/SPA delivery, 4b migration guard, 4c
-concurrency cap, 4d observability, 4e slim image, 4f docs). Custom domain +
-ALB-level Cognito enforcement remains intentionally **deferred** (needs the real
-DNS zone + ACM); the HTTPS listener + auth seam is already in the backend module.
+concurrency cap, 4d observability, 4e slim image, 4f docs, 4g custom domain +
+OIDC auth). Putting the pool behind a *specific* external IdP (the actual
+JumpCloud/Okta federation config) is the only remaining auth follow-up — the
+seam is in place (`identity_providers`).
 
 ---
 

@@ -16,9 +16,9 @@ set your variables, and apply the Terraform.
 > `terraform apply` builds + pushes both backend images and publishes the SPA;
 > migrations are advisory-lock-guarded; a per-firmware Batch concurrency cap and
 > CloudWatch alarms/dashboard are in place; the Fargate image is slimmed (no
-> Ghidra); and `docs/RUNBOOK.md` + `docs/COST.md` document operations and cost.
-> Custom domain / ALB-level Cognito enforcement is intentionally deferred (needs
-> a real DNS zone + ACM); the seam is in the backend module.
+> Ghidra); an optional custom domain + Cognito/OIDC login (SSO-ready — federate
+> JumpCloud/Okta into the pool) is flag-gated and live-validated; and
+> `docs/RUNBOOK.md` + `docs/COST.md` document operations and cost.
 
 ## Why this exists
 

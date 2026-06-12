@@ -73,6 +73,30 @@ aws cognito-idp admin-create-user \
   --user-attributes Name=email,Value=analyst@example.com Name=email_verified,Value=true
 ```
 
+### Custom domain + login (optional, SSO-ready)
+
+All optional and flag-gated — set nothing and the app serves open on the
+CloudFront domain.
+
+```hcl
+domain_name     = "wairz.example.com"   # your domain
+route53_zone_id = "Z0123456789ABCDEF"   # the hosted zone that owns it
+auth_enabled    = true                  # require Cognito login (needs domain_name)
+```
+
+`apply` then provisions an ACM cert (DNS-validated in your zone), points the
+domain at CloudFront, and turns on auth: the SPA requires sign-in (Authorization
+Code + PKCE against the Cognito hosted UI) and the API requires a valid bearer
+token (validated against the pool's JWKS). With auth on and no NAT, a
+`cognito-idp` VPC endpoint is added so the backend can reach the JWKS privately —
+without it a valid token hangs the request (CloudFront 504).
+
+**SSO via an external IdP (JumpCloud/Okta/Azure AD/…):** Cognito is the
+federation broker. Add a SAML 2.0 or OIDC identity provider to the user pool
+(`aws_cognito_identity_provider`, or the console) and add its name to the auth
+module's `identity_providers`. The SPA login flow is unchanged — the hosted UI
+brokers to your IdP. No app or SPA code change.
+
 ### Out-of-band image/SPA builds (CI)
 
 Set `auto_deploy_images = false` and pass `image_tag = "<tag>"`. Build/push to

@@ -47,6 +47,11 @@ expected analyses/day; even heavy use is usually < $20/mo.
 | **Smaller/zero baseline** | `desired_count` (already 1) | — | 1 is the floor for an always-on API |
 | Spot Ghidra (default on) | `batch_use_spot = true` | — | rare interruption → job re-runs (idempotent) |
 
+**Custom domain + auth (`auth_enabled`):** ACM certs are free and Route53 is
+~$0.50/mo per zone. With auth on and no NAT, one extra `cognito-idp` interface
+endpoint is added so the backend can validate tokens privately (~$7/mo, single
+AZ). Negligible against the baseline.
+
 **Illustrative configs:**
 
 - **Defaults (security-first, always-warm):** ~$220/mo at rest.
