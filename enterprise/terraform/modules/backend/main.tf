@@ -25,26 +25,34 @@ resource "aws_ecs_cluster" "this" {
 }
 
 # --- Security groups --------------------------------------------------------
+# Only CloudFront may reach the ALB: ingress is restricted to AWS's managed
+# CloudFront origin-facing prefix list, so the ALB can't be hit directly over
+# the internet (which would bypass CloudFront's TLS/custom-domain and any WAF).
+# Defense in depth alongside the app's bearer-token auth.
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
 resource "aws_security_group" "alb" {
   name_prefix = "${var.name}-alb-"
-  description = "Public HTTP(S) to the ALB"
+  description = "CloudFront-only HTTP(S) to the ALB"
   vpc_id      = var.vpc_id
 
   ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "HTTP from CloudFront"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
   }
   dynamic "ingress" {
     for_each = var.certificate_arn == "" ? [] : [1]
     content {
-      description = "HTTPS"
-      from_port   = 443
-      to_port     = 443
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
+      description     = "HTTPS from CloudFront"
+      from_port       = 443
+      to_port         = 443
+      protocol        = "tcp"
+      prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
     }
   }
   egress {
@@ -55,6 +63,11 @@ resource "aws_security_group" "alb" {
   }
   lifecycle { create_before_destroy = true }
   tags = { Name = "${var.name}-alb" }
+
+  # The CloudFront prefix list expands to ~55 entries, each counting as a rule
+  # against the per-SG quota (default 60). HTTP-only (the default, TLS at the
+  # edge) fits; enabling the optional ALB HTTPS listener too may need the quota
+  # raised.
 }
 
 resource "aws_security_group" "service" {

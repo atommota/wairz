@@ -21,6 +21,34 @@ resource "aws_cloudfront_origin_access_control" "spa" {
   signing_protocol                  = "sigv4"
 }
 
+# Baseline security response headers for the SPA: HSTS + clickjacking/MIME
+# hardening. A strict Content-Security-Policy is intentionally omitted (the SPA
+# uses Monaco/blob web workers + Cognito redirects, which need a carefully tuned
+# policy) — see the security review follow-ups.
+resource "aws_cloudfront_response_headers_policy" "security" {
+  name = "${var.name}-security-headers"
+
+  security_headers_config {
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = true
+      preload                    = true
+      override                   = true
+    }
+    content_type_options {
+      override = true
+    }
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = true
+    }
+  }
+}
+
 locals {
   s3_origin_id  = "spa-s3"
   alb_origin_id = "backend-alb"
@@ -52,12 +80,13 @@ resource "aws_cloudfront_distribution" "this" {
 
   # SPA static assets (default).
   default_cache_behavior {
-    target_origin_id       = local.s3_origin_id
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    cache_policy_id        = data.aws_cloudfront_cache_policy.optimized.id
-    compress               = true
+    target_origin_id           = local.s3_origin_id
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS"]
+    cached_methods             = ["GET", "HEAD"]
+    cache_policy_id            = data.aws_cloudfront_cache_policy.optimized.id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.security.id
+    compress                   = true
   }
 
   # API + websockets → ALB, uncached, forward everything.

@@ -47,6 +47,11 @@ resource "aws_cognito_user_pool_client" "this" {
   callback_urls = var.callback_urls
   logout_urls   = var.logout_urls
 
+  # Don't reveal whether an account exists on failed auth; allow token
+  # revocation on sign-out.
+  prevent_user_existence_errors = "ENABLED"
+  enable_token_revocation       = true
+
   explicit_auth_flows = [
     "ALLOW_USER_SRP_AUTH",
     "ALLOW_REFRESH_TOKEN_AUTH",

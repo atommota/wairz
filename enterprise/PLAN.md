@@ -666,3 +666,40 @@ nothing in the IaC hard-codes their absence in a way that blocks adding them.
 4. **Remote state bootstrap:** ship local-state default + documented migration,
    or a bootstrap module for the S3/DynamoDB backend. Default: **documented
    migration**.
+
+---
+
+## 11. Security review (2026-06-11)
+
+Reviewed the auth/domain work + serving layer; fixed and **live-validated** the
+findings below (then torn down clean). Off-by-default auth means none of this
+affects the local docker-compose deploy.
+
+**Fixed:**
+- **[CRITICAL] WebSocket auth bypass.** The http auth middleware can't see
+  WebSockets, so with `auth_enabled` the terminal (`/api/.../terminal/ws`, which
+  `fork`+`execve`'s a shell on the backend task) and the emulation terminal were
+  reachable **unauthenticated** — a shell on the Fargate task exposes the
+  `DATABASE_URL` env and the ECS task-role credentials. Fix: `authorize_websocket`
+  validates a token (query param `access_token`, since browsers can't set WS
+  headers) right after `accept()`, closing 4401 if missing/invalid; SPA passes the
+  token on the WS URL. Validated live: no/garbage token → 4401, valid token →
+  past-auth.
+- **[HIGH] ALB open to the internet (CloudFront bypass).** The ALB SG allowed
+  `0.0.0.0/0`, so it could be hit directly, bypassing CloudFront (and reaching the
+  un-gated WS). Fix: ingress restricted to the `cloudfront.origin-facing` managed
+  prefix list. Validated: direct ALB hit times out; via CloudFront → 200.
+- **[MED] ID tokens accepted for API access.** The verifier didn't check
+  `token_use`; a Cognito ID token would pass. Now rejects `token_use != access`
+  (only when present, so still IdP-agnostic).
+- **[LOW] Missing security headers / Cognito hardening.** Added a CloudFront
+  response-headers policy (HSTS, X-Frame-Options DENY, nosniff, referrer-policy)
+  and set the Cognito client `prevent_user_existence_errors=ENABLED` +
+  `enable_token_revocation=true`.
+
+**Open (judgement calls — left as-is, see follow-ups):** strict CSP (needs tuning
+for Monaco/blob workers + Cognito); Cognito MFA / advanced-security (vs relying on
+the federated IdP for MFA); SPA token storage in `localStorage` (XSS-exposed) vs
+in-memory; Redis transit encryption + AUTH token (VPC-internal today); whether the
+powerful in-firmware **terminal** (a real shell on the backend task, usable by any
+authenticated team member) belongs in the cloud build at all.
