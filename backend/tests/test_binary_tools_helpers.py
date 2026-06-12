@@ -178,3 +178,51 @@ async def test_hexdump_data_offset_past_eof(tmp_path):
     ctx = types.SimpleNamespace(resolve_path=lambda p: str(f))
     out = await binary._handle_hexdump_data({"binary_path": "/x.bin", "offset": 100}, ctx)
     assert "No bytes at offset 100" in out
+
+
+# --- decompile_function cloud routing (cache hit vs async) -------------------
+
+
+def _cloud_ctx():
+    return types.SimpleNamespace(
+        firmware_id=FW, db=_FakeDB(),
+        real_root_for=lambda p: "/r", resolve_path=lambda p: "/r/bin/x",
+    )
+
+
+async def test_decompile_cloud_cache_hit_returns_code(monkeypatch):
+    monkeypatch.setattr(binary, "get_settings", lambda: _settings("aws_batch"))
+
+    class C:
+        async def get_binary_sha256(self, p): return "abc"
+        async def _is_analysis_complete(self, *a): return True
+        async def get_functions(self, *a, **k): return [{"name": "main", "is_thunk": False}]
+        async def get_imports(self, *a, **k): return []
+        async def _get_cached(self, fw, sha, op, db):
+            return {"decompiled_code": "int main(){return 0;}"} if op == "decompile:main" else None
+
+    monkeypatch.setattr(binary, "get_analysis_cache", lambda: C())
+    out = await binary._handle_decompile_function(
+        {"binary_path": "/bin/x", "function_name": "main"}, _cloud_ctx())
+    assert "int main(){return 0;}" in out
+
+
+async def test_decompile_cloud_cache_miss_routes_async(monkeypatch):
+    monkeypatch.setattr(binary, "get_settings", lambda: _settings("aws_batch"))
+
+    class C:
+        async def get_binary_sha256(self, p): return "abc"
+        async def _is_analysis_complete(self, *a): return True
+        async def get_functions(self, *a, **k): return [{"name": "main", "is_thunk": False}]
+        async def get_imports(self, *a, **k): return []
+        async def _get_cached(self, *a): return None  # miss
+
+    monkeypatch.setattr(binary, "get_analysis_cache", lambda: C())
+
+    async def fake_start(inp, ctx):
+        return "started - decompiling, poll check_function_decompile_status."
+    monkeypatch.setattr(binary, "_handle_start_function_decompile", fake_start)
+
+    out = await binary._handle_decompile_function(
+        {"binary_path": "/bin/x", "function_name": "main"}, _cloud_ctx())
+    assert "started" in out and "check_function_decompile_status" in out

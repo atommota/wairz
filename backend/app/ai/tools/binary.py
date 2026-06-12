@@ -592,6 +592,22 @@ async def _handle_decompile_function(input: dict, context: ToolContext) -> str:
     if hint is not None:
         return hint
 
+    # In cloud mode a per-function decompile CACHE MISS spawns a fresh Ghidra
+    # subprocess whose startup alone exceeds the gateway's ~60s edge (so any
+    # uncached function — or a by-address lookup, which can't hit the name-keyed
+    # cache — would 504). Serve a cache hit directly; otherwise route to the
+    # async decompile worker and return a poll handle. Local mode keeps the
+    # synchronous behavior (no gateway timeout).
+    if get_settings().compute_backend != "local":
+        cache = get_analysis_cache()
+        sha256 = await cache.get_binary_sha256(path)
+        cached = await cache._get_cached(
+            context.firmware_id, sha256, f"decompile:{function_name}", context.db,
+        )
+        if cached and cached.get("decompiled_code"):
+            return f"Decompiled output for {function_name}:\n\n{cached['decompiled_code']}"
+        return await _handle_start_function_decompile(input, context)
+
     try:
         result = await decompile_function(
             binary_path=path,

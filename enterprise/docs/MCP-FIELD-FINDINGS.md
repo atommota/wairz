@@ -41,6 +41,25 @@ Details + proposed fixes: `enterprise/PLAN.md` Phase 6.
 
 ---
 
+## Fix status (updated 2026-06-12)
+
+| Item | Status |
+|---|---|
+| Core #1 PLT/import-stub blindness | ✅ **fixed** (`3f44b89`) — detect thunk/import → route to resolve_import; live-validated (0.9s vs 600s hang) |
+| Core #2 resolve_import false negative | ✅ **fixed** (`3f44b89`) — whole-rootfs lib search + precise "why" diagnostics; live-validated (found pingTest in libsml.so) |
+| Core #3 no decompile/disassemble by address | ✅ **fixed** (`a110bed`) — decompile_function accepts `0x…` (now incl. getFunctionContaining), documented |
+| Core #4 hexdump_data unimplemented | ✅ **fixed** (`a110bed`) — implemented as a real tool |
+| Core #5 search_strings param naming | ✅ **fixed** (`a110bed`) — accepts `query` alias |
+| Core #6 warm_analysis_worker not coupled to readiness | ⏳ open (low) |
+| Cloud #2 sync tools 504 on cold cache | ✅ **fixed** (`3f44b89`) — async "analyzing — poll" handle |
+| Cloud #2b status-poll / dispatch blocks event loop | ✅ **mitigated** (`a110bed`) — boto3 wrapped in `asyncio.to_thread` |
+| Cloud #1 CloudFront HTML error pages | ⏳ open — largely subsumed (fewer 504s); residual is CloudFront's own page on origin-down |
+| Cloud #3 persist active project across reconnect | ⏳ open — needs token-identity plumbing through the transport |
+
+The per-item detail below is retained for the open items + as a record.
+
+---
+
 ## Open — core tool bugs (reproduce locally; against `main`/product)
 
 ### 1. PLT/import-stub blindness in `decompile_function` / `disassemble_function` — HIGH
