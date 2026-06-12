@@ -1,5 +1,6 @@
 """Binary analysis AI tools using Ghidra and pyelftools."""
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -192,7 +193,7 @@ async def _ensure_analyzed_or_route(path: str, context: ToolContext) -> str | No
     status_row = await cache.get_run_status(context.firmware_id, sha256, context.db)
     if status_row and status_row.get("status") == "running":
         job_ref = status_row.get("job_ref")
-        if describe_batch_job_state(job_ref) in ("queued", "starting", "running"):
+        if (await asyncio.to_thread(describe_batch_job_state, job_ref)) in ("queued", "starting", "running"):
             elapsed = int(time.time() - status_row.get("started_at", 0))
             return (
                 f"analyzing - {base} is being analyzed in the background "
@@ -200,7 +201,9 @@ async def _ensure_analyzed_or_route(path: str, context: ToolContext) -> str | No
                 f"check_binary_analysis_status until 'complete', then retry."
             )
     try:
-        handle = get_dispatcher().dispatch_analysis(context.firmware_id, path, sha256)
+        handle = await asyncio.to_thread(
+            get_dispatcher().dispatch_analysis, context.firmware_id, path, sha256,
+        )
     except ConcurrencyLimitError as exc:
         return f"rejected - {exc}"
     await cache.mark_run_started(
@@ -1593,7 +1596,7 @@ async def _handle_start_binary_analysis(
         # forever even though nothing is running.
         job_ref = status_row.get("job_ref")
         if get_settings().compute_backend != "local":
-            in_flight = describe_batch_job_state(job_ref) in ("queued", "starting", "running")
+            in_flight = (await asyncio.to_thread(describe_batch_job_state, job_ref)) in ("queued", "starting", "running")
         else:
             pid = status_row.get("pid")
             in_flight = pid is not None and _pid_is_alive(int(pid))
@@ -1612,8 +1615,8 @@ async def _handle_start_binary_analysis(
     # aws_batch) submit the same worker as a remote job. Either way the worker
     # writes its result to the cache rows the status tool polls.
     try:
-        handle = get_dispatcher().dispatch_analysis(
-            context.firmware_id, path, sha256,
+        handle = await asyncio.to_thread(
+            get_dispatcher().dispatch_analysis, context.firmware_id, path, sha256,
         )
     except ConcurrencyLimitError as exc:
         return f"rejected - {exc}"
@@ -1669,7 +1672,7 @@ async def _handle_check_binary_analysis_status(
             # Distributed worker (e.g. AWS Batch): there's no local pid to probe;
             # ask the dispatch backend for the job's state instead. The cache
             # completion check above remains the source of truth for "done".
-            state = describe_batch_job_state(job_ref)
+            state = (await asyncio.to_thread(describe_batch_job_state, job_ref))
             if state == "failed":
                 return (
                     f"failed - analysis job {job_ref} failed. Call "
@@ -1799,7 +1802,7 @@ async def _handle_check_function_decompile_status(
         elapsed = int(time.time() - status_row.get("started_at", 0))
         job_ref = status_row.get("job_ref")
         if get_settings().compute_backend != "local":
-            state = describe_batch_job_state(job_ref)
+            state = (await asyncio.to_thread(describe_batch_job_state, job_ref))
             if state == "failed":
                 return (
                     f"failed - decompile job {job_ref} failed. Call "
@@ -1875,8 +1878,75 @@ async def _handle_warm_analysis_worker(input: dict, context: ToolContext) -> str
     )
 
 
+def _format_hexdump(data: bytes, base_offset: int = 0) -> str:
+    """Classic `hexdump -C` style: offset | 16 hex bytes | ASCII gutter."""
+    lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        hex_part = f"{hex_part:<47}"  # pad to a fixed width (16*3-1)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{base_offset + i:08x}  {hex_part}  |{ascii_part}|")
+    return "\n".join(lines)
+
+
+async def _handle_hexdump_data(input: dict, context: ToolContext) -> str:
+    """Raw hex dump of bytes from a file at an offset (no analysis needed)."""
+    path = context.resolve_path(input["binary_path"])
+    try:
+        offset = int(input.get("offset", 0))
+        length = max(0, min(int(input.get("length", 256)), 4096))
+    except (TypeError, ValueError):
+        return "Error: offset and length must be integers."
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
+    except OSError as exc:
+        return f"Error reading '{input['binary_path']}': {exc}"
+    if not data:
+        return (
+            f"No bytes at offset {offset} — file is {size} bytes "
+            f"({os.path.basename(path)})."
+        )
+    return (
+        f"Hex dump of {os.path.basename(path)} @ offset {offset} "
+        f"({len(data)} of {size} bytes):\n\n{_format_hexdump(data, offset)}"
+    )
+
+
 def register_binary_tools(registry: ToolRegistry) -> None:
     """Register all binary analysis tools with the given registry."""
+
+    registry.register(
+        name="hexdump_data",
+        description=(
+            "Raw hex dump of bytes from a file at a byte offset (hexdump -C "
+            "style: offset, hex, ASCII). No Ghidra analysis required — works on "
+            "any file. Use to inspect headers, magic bytes, embedded data, or "
+            "raw regions. Capped at 4096 bytes per call; page with offset."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "binary_path": {
+                    "type": "string",
+                    "description": "Path to the file within the firmware filesystem.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Byte offset to start at (default 0).",
+                },
+                "length": {
+                    "type": "integer",
+                    "description": "Bytes to dump (default 256, max 4096).",
+                },
+            },
+            "required": ["binary_path"],
+        },
+        handler=_handle_hexdump_data,
+    )
 
     registry.register(
         name="start_binary_analysis",
@@ -2091,7 +2161,7 @@ def register_binary_tools(registry: ToolRegistry) -> None:
                 },
                 "function_name": {
                     "type": "string",
-                    "description": "Function name to decompile (e.g. 'main', 'auth_check'). Use list_functions to find available names.",
+                    "description": "Function name to decompile (e.g. 'main', 'auth_check'), OR a hex address like '0x401000' to decompile the function at/containing that address (useful for stripped or unnamed functions). Use list_functions to find names. If this resolves to an import/PLT thunk, use resolve_import instead.",
                 },
             },
             "required": ["binary_path", "function_name"],

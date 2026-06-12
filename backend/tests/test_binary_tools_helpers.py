@@ -152,3 +152,29 @@ async def test_gate_cloud_cold_dispatches(monkeypatch):
     assert out.startswith("analyzing") and "job-xyz" in out
     assert "check_binary_analysis_status" in out
     assert dispatched.get("marked")
+
+
+# --- hexdump_data ------------------------------------------------------------
+
+
+def test_format_hexdump():
+    out = binary._format_hexdump(b"\x7fELF\x01\x02hello", 0)
+    assert out.startswith("00000000  7f 45 4c 46 01 02 68 65 6c 6c 6f")
+    assert out.endswith("|.ELF..hello|")
+
+
+async def test_hexdump_data_reads_file(tmp_path):
+    f = tmp_path / "blob.bin"
+    f.write_bytes(b"ABCD" * 10)
+    ctx = types.SimpleNamespace(resolve_path=lambda p: str(f))
+    out = await binary._handle_hexdump_data(
+        {"binary_path": "/blob.bin", "offset": 0, "length": 8}, ctx)
+    assert "Hex dump of blob.bin" in out and "41 42 43 44" in out
+
+
+async def test_hexdump_data_offset_past_eof(tmp_path):
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"AB")
+    ctx = types.SimpleNamespace(resolve_path=lambda p: str(f))
+    out = await binary._handle_hexdump_data({"binary_path": "/x.bin", "offset": 100}, ctx)
+    assert "No bytes at offset 100" in out
