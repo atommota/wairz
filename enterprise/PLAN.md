@@ -724,6 +724,50 @@ independent**. MCP TG `/healthz` healthy; SPA + REST API unaffected.
 > out-of-scope features in the cloud build (no `docker.sock`/privileged worker in
 > Fargate). Remote MCP does **not** depend on them.
 
+### Phase 6 — Cloud-MCP UX hardening — ⏳ NOT STARTED
+
+From the **first real agent session** driving the cloud MCP end-to-end
+(2026-06-12; full triage in `docs/MCP-FIELD-FINDINGS.md`). The Batch-dispatch
+chain that dominated that session is fixed (§4 batch fixes); what remains are
+transport/UX issues that cost the agent the most time.
+
+**Already fixed in that session (context, not work):** the mid-session task
+reaping (root cause = boto3 hang on the missing `batch` VPC endpoint, §4) and the
+one-off `batch:TagResource` IAM-propagation error. Those won't recur.
+
+**Open — in priority order:**
+
+1. **Typed, retryable errors instead of CloudFront HTML.** When the origin is
+   down/slow, CloudFront serves its HTML error page (and the SPA `custom_error_
+   response` rewrites 4xx→`index.html`), so the MCP client gets
+   `Unexpected content type: text/html` — indistinguishable from a real result.
+   The agent had to regex HTML to guess intent, and repeatedly mis-concluded
+   "backend is down" when a heavy job was merely slow. **Highest leverage.**
+   Options: a dedicated CloudFront error-response config for `/mcp*` (don't apply
+   the SPA index.html rewrite to the API/MCP paths); ensure the sidecar emits
+   proper JSON-RPC errors with a `retryable` hint; consider a short origin
+   `read_timeout` + explicit 504 JSON rather than a hung edge.
+2. **Async job handles for heavy RE tools.** `decompile_function` /
+   `list_functions` block synchronously and 504 at CloudFront's 60s edge on a
+   cold cache, while `start_binary_analysis` is the async fire-and-poll path. New
+   users won't know to call the async one first. Make the sync tools detect a
+   cold cache and **return a job handle** (or auto-route to the async path)
+   instead of blocking. Ties into the broader "don't block the sidecar event
+   loop on synchronous boto3/Ghidra" hardening (run them in a threadpool so
+   `/healthz` and concurrent calls stay responsive — this is also what made
+   `check_binary_analysis_status` itself 504 during cold start).
+3. **Persist active project across reconnect.** A `/mcp` reconnect starts a fresh
+   MCP session → empty `ProjectState` → every tool returns "No project is active"
+   until `switch_project` is re-run. Re-bind the last project server-side keyed
+   to the token/user (or have the client re-issue `switch_project` on reconnect).
+
+The **core-product tool bugs** the same session surfaced (PLT/import-stub
+blindness in `decompile_function`, `resolve_import` false negatives,
+decompile/disassemble-by-address, `hexdump_data` unimplemented, `search_strings`
+param naming, `warm_analysis_worker` not coupled to readiness) are **not
+cloud-specific** — they reproduce on a local install — and are tracked separately
+in `docs/MCP-FIELD-FINDINGS.md` against `main`/the product, not this branch.
+
 ---
 
 ## 7. Shared-team-instance requirements (don't forget)
