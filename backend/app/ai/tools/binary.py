@@ -1392,13 +1392,26 @@ async def _handle_start_binary_analysis(
         context.firmware_id, sha256, context.db,
     )
     if status_row and status_row.get("status") == "running":
-        elapsed = int(time.time() - status_row.get("started_at", 0))
-        pid = status_row.get("pid")
-        return (
-            f"already_running - analysis is already in progress for "
-            f"{os.path.basename(path)} ({elapsed}s elapsed, pid={pid}). "
-            f"Poll check_binary_analysis_status."
-        )
+        # Only block re-dispatch if the worker is genuinely still in flight. A
+        # crashed/failed Batch job (or a dead local worker) leaves a stale
+        # "running" row; without this check the binary could never be
+        # re-analyzed — start_binary_analysis would return "already_running"
+        # forever even though nothing is running.
+        job_ref = status_row.get("job_ref")
+        if get_settings().compute_backend != "local":
+            in_flight = describe_batch_job_state(job_ref) in ("queued", "starting", "running")
+        else:
+            pid = status_row.get("pid")
+            in_flight = pid is not None and _pid_is_alive(int(pid))
+        if in_flight:
+            elapsed = int(time.time() - status_row.get("started_at", 0))
+            return (
+                f"already_running - analysis is already in progress for "
+                f"{os.path.basename(path)} ({elapsed}s elapsed, "
+                f"job={job_ref or status_row.get('pid')}). "
+                f"Poll check_binary_analysis_status."
+            )
+        # Stale row from a crashed/failed run — fall through and re-dispatch.
 
     # Hand off to the configured compute backend. The "local" dispatcher
     # spawns a detached worker subprocess on this host; other backends (e.g.
