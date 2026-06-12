@@ -52,6 +52,7 @@ Details + proposed fixes: `enterprise/PLAN.md` Phase 6.
 | Core #5 search_strings param naming | ✅ **fixed** (`a110bed`) — accepts `query` alias |
 | Core #6 warm_analysis_worker not coupled to readiness | ⏳ open (low) |
 | Cloud #2 sync tools 504 on cold cache | ✅ **fixed** (`3f44b89`) — async "analyzing — poll" handle |
+| Cloud #2c decompile_function 504s on cache-miss (uncached/by-address) | ✅ **fixed** (`5c9b72a`) — cache hit served direct, else routed to async decompile worker; live-validated (0.8s handle vs 60s timeout) |
 | Cloud #2b status-poll / dispatch blocks event loop | ✅ **mitigated** (`a110bed`) — boto3 wrapped in `asyncio.to_thread` |
 | Cloud #1 CloudFront HTML error pages | ⏳ open — largely subsumed (fewer 504s); residual is CloudFront's own page on origin-down |
 | Cloud #3 persist active project across reconnect | ⏳ open — needs token-identity plumbing through the transport |
