@@ -77,8 +77,10 @@ resource "aws_batch_job_definition" "import" {
   platform_capabilities = ["EC2"]
 
   container_properties = jsonencode({
-    image            = "${aws_ecr_repository.ghidra.repository_url}:${var.image_tag}"
-    command          = ["python", "-m", "app.workers.run_ghidra_analysis", "--help"]
+    image = "${aws_ecr_repository.ghidra.repository_url}:${var.image_tag}"
+    # Overridden at submit; use the venv interpreter (the image bakes deps into
+    # /app/.venv — bare "python" is the slim base Python without them).
+    command          = ["/app/.venv/bin/python", "-m", "app.workers.run_ghidra_analysis", "--help"]
     jobRoleArn       = aws_iam_role.job.arn
     executionRoleArn = aws_iam_role.execution.arn
 

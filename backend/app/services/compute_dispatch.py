@@ -55,6 +55,13 @@ class ConcurrencyLimitError(RuntimeError):
 # Batch job statuses that still consume (or are about to consume) queue/compute.
 _ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
 
+# The Ghidra image bakes the project venv at /app/.venv (uv sync). The worker
+# MUST run with that interpreter — bare "python" is the slim base image's system
+# Python, which has none of the project deps (pydantic_settings, sqlalchemy, …)
+# → ModuleNotFoundError at import. `uv run` is not an option (it re-resolves
+# against pypi, which the no-egress Batch instance can't reach).
+_WORKER_PYTHON = "/app/.venv/bin/python"
+
 
 @dataclass
 class JobHandle:
@@ -224,7 +231,7 @@ class BatchDispatcher(ComputeDispatcher):
         return self._submit(
             _job_name(f"wairz-{token}-an", sha256),
             [
-                "python", "-m", "app.workers.run_ghidra_analysis",
+                _WORKER_PYTHON, "-m", "app.workers.run_ghidra_analysis",
                 "--firmware-id", str(firmware_id),
                 "--binary-path", binary_path,
                 "--sha256", sha256,
@@ -244,7 +251,7 @@ class BatchDispatcher(ComputeDispatcher):
         return self._submit(
             _job_name(f"wairz-{token}-dec", sha256, function_name),
             [
-                "python", "-m", "app.workers.run_function_decompile",
+                _WORKER_PYTHON, "-m", "app.workers.run_function_decompile",
                 "--firmware-id", str(firmware_id),
                 "--binary-path", binary_path,
                 "--sha256", sha256,
