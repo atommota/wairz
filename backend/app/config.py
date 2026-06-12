@@ -93,6 +93,22 @@ class Settings(BaseSettings):
     # requests keep arriving and exits after this long with an empty queue.
     re_worker_idle_ttl_minutes: int = 20
 
+    # --- Auth (OIDC / JWT bearer) ------------------------------------------
+    # Enforce bearer-token auth on the HTTP API. Default off keeps the local
+    # docker-compose deploy open and unauthenticated. When on, every request
+    # (outside the allowlist) needs a valid OIDC access token; the SPA obtains
+    # one via the Cognito hosted-UI login. IdP-agnostic: point oidc_issuer at
+    # the deployment's Cognito pool, or any OIDC issuer — so an operator can
+    # federate JumpCloud/Okta into Cognito (or use them directly) without a
+    # code change. Does not affect the MCP server (it calls services directly).
+    auth_enabled: bool = False
+    # e.g. https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
+    oidc_issuer: str = ""
+    # App client id; matched against the token's `aud` or (Cognito) `client_id`.
+    oidc_audience: str = ""
+    # Defaults to "<oidc_issuer>/.well-known/jwks.json" when blank.
+    oidc_jwks_url: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from app.auth.oidc import auth_guard
 from app.config import get_settings
 from app.routers import analysis, comparison, component_map, documents, emulation, export_import, files, findings, firmware, fuzzing, kernels, projects, reports, sbom, terminal, uart
 from app.services.carving_service import CarvingService
@@ -80,6 +81,12 @@ async def origin_host_guard(request: Request, call_next):
     if origin and not _ORIGIN_WILDCARD and origin not in ALLOWED_ORIGINS:
         return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
     return await call_next(request)
+
+
+# Bearer-token auth on the HTTP API. No-op when settings.auth_enabled is false
+# (the local default), so docker-compose stays open. Registered after the host
+# guard; both run per request.
+app.middleware("http")(auth_guard)
 
 app.include_router(projects.router)
 app.include_router(firmware.router)
