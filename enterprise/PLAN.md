@@ -608,6 +608,106 @@ OIDC auth). Putting the pool behind a *specific* external IdP (the actual
 JumpCloud/Okta federation config) is the only remaining auth follow-up — the
 seam is in place (`identity_providers`).
 
+### Phase 5 — Remote MCP (cloud-usable AI path) — 🚧 APP LAYER DONE, INFRA PENDING
+
+**Status (2026-06-12):** the backend application layer (5a/5b/5c) is **code-complete
++ unit-tested** (`backend/tests/test_mcp_http.py`, 6 tests; full suite 282 passed,
+the 4 reds are the pre-existing stale `_FakeFirmware`/yaffs fixtures, unchanged by
+this work). **Not yet wired into the cloud (Dockerfile/Terraform/CloudFront) and
+not live-validated.** See "Progress" below.
+
+**The gap.** Phases 1–4 made the *web SPA* cloud-native and Cognito-gated, but
+they did **not** make the **MCP path** — the actual way Claude drives Wairz —
+work in the cloud. The MCP server is **stdio-only** (`mcp_server.py:30,941`) and
+connects **directly to Aurora** (`create_async_engine`/`async_sessionmaker`,
+`mcp_server.py:424`) and **directly to the firmware files** (sandbox-validated
+against `extracted_path`), *not* through the HTTP API. In the cloud, Aurora is in
+a **private subnet** and the extracted firmware lives on **EFS**, so a laptop
+running `wairz-mcp` against `wairz.example.com` can reach **neither**. CloudFront
++ Cognito gate the SPA; they do nothing for MCP, because MCP never traverses that
+front door. The auth work deliberately left it alone ("MCP unaffected — direct
+service calls", §6/Phase 4g).
+
+**Consequence today.** The only way to drive a cloud instance with Claude is to
+run the stdio MCP **inside the VPC** — `aws ecs execute-command` into the backend
+task (it already mounts EFS and holds the DB URL) and run `wairz-mcp` there. That
+"SSH-in" model is a single process with a single project context and no clean
+multi-user story. **The cloud deployment is therefore not genuinely usable via
+MCP yet** — this is the most important remaining gap for the cloud version.
+
+**Target design.** Co-locate an MCP endpoint **with the backend** (already in the
+VPC with EFS + Aurora) and expose it as a **Streamable HTTP MCP transport**,
+routed through CloudFront/ALB at `/mcp`, gated by the **same Cognito JWT
+verifier** that guards the REST API (`app/auth/oidc.py`). Claude Code/Desktop
+then connects to a URL with a bearer token — no SSH, no VPN, riding the existing
+auth and front door. No data-plane change: the in-VPC process keeps its direct
+DB + EFS access; only the *transport* and *session model* change.
+
+**Work items (each a genuine change — not just flipping a flag):**
+
+| # | Item | Where | Notes |
+|---|---|---|---|
+| **5a** | **HTTP transport** — serve the existing `ToolRegistry` over the MCP SDK's Streamable HTTP server instead of `stdio_server()`. Run it in/alongside the backend task (sidecar container or an `/mcp` route on the FastAPI app). | `app/mcp_server.py`, `app/main.py`, `modules/backend` (task def + ALB/CloudFront `/mcp` behavior) | Keep stdio as the default for local/Desktop; HTTP is the cloud opt-in. |
+| **5b** | **Per-session `ProjectState`** — today `switch_project` mutates a **process-global** singleton (`mcp_server.py`). Fine for one stdio process per user; with one HTTP endpoint serving many users it lets them stomp each other's active project. Key state off the MCP session id (`Mcp-Session-Id`). | `app/mcp_server.py` (`ProjectState` lifecycle), tool dispatch | The empty-state + `switch_project` model was built for many users on one server (§7) — this completes it for the HTTP transport. |
+| **5c** | **Client-auth wiring** — map Claude Code's remote-MCP OAuth (or a static bearer) to a Cognito token; reuse the RS256 JWKS verifier. Reject unauthenticated `/mcp` exactly as the REST middleware does. | `app/auth/oidc.py` (reuse), `/mcp` guard, docs/RUNBOOK | Same IdP-agnostic posture; SSO federation (`identity_providers`) carries over for free. |
+
+**Seams already friendly to this:** the JWT verifier exists and is transport-
+agnostic; the backend task already has DB + EFS; the registry is a plain object
+servable over any transport; `switch_project` + empty-state were designed for
+multi-user. The work is real but contained to 5a–5c.
+
+**Progress (2026-06-12) — application layer:**
+
+- **5a HTTP transport — DONE (code).** `app/mcp_server.py` refactored: the build
+  is split into `build_mcp_server()` (transport-agnostic — all tools/resources/
+  prompts) + `run_server()` (stdio, unchanged behavior) + `build_http_app()`
+  (Streamable HTTP via the SDK's `StreamableHTTPSessionManager`, stateful
+  sessions). New CLI: `wairz-mcp --transport http [--host --port --path]`;
+  stdio stays the default. **Decision: run HTTP as its own ASGI app (sidecar),
+  not mounted into the FastAPI app** — the REST app's two `BaseHTTPMiddleware`
+  guards (`origin_host_guard`, `auth_guard`) buffer responses and would stall
+  MCP's SSE streams. A sidecar in the same ECS task shares the EFS mount, DB, and
+  OIDC env, and ALB/CloudFront path-routes `/mcp` to its port. (Alternative —
+  convert those guards to pure-ASGI middleware and mount in-process — left as a
+  future option; the sidecar avoids touching reviewed REST code.)
+- **5b Per-session `ProjectState` — DONE (code).** stdio keeps one shared
+  preloaded state (byte-identical); HTTP keys a `ProjectState` off the
+  per-session `ServerSession` via a `WeakKeyDictionary` (auto-evicted on
+  disconnect — no leak). `switch_project`'s `send_tool_list_changed` targets
+  only the calling session. Test proves two concurrent sessions hold distinct
+  states and the map empties after both close.
+- **5c Client-auth — DONE (code).** `build_http_app` gates the endpoint with the
+  *same* `OIDCVerifier` (`app/auth/oidc.py`) as the REST API, via a pure-ASGI
+  bearer check (no buffering): no/invalid token → 401, valid Cognito token →
+  through. Off when `auth_enabled` is false (logs a loud warning). Tests cover
+  all four cases.
+
+**Remaining (infra + validation):**
+
+1. **Package the sidecar** — the slim backend image already contains the code;
+   add a second container to the ECS task definition running `wairz-mcp
+   --transport http` (same env: `DATABASE_URL`, `REDIS_URL`, `STORAGE_ROOT`,
+   `AUTH_ENABLED`, `OIDC_*`), sharing the EFS mount. `modules/backend`.
+2. **Route `/mcp`** — ALB target group + listener rule (or a second ALB) to the
+   sidecar port; CloudFront `ordered_cache_behavior` for `/mcp*` (uncached,
+   all-viewer, methods incl. POST/DELETE) → ALB. `modules/backend`,
+   `modules/frontend`.
+3. **Client auth UX** — confirm Claude Code's remote-MCP connect against a
+   Cognito bearer (static token via `--header`, or wire the hosted-UI OAuth).
+   Decide token-issuance ergonomics for end users. `docs/RUNBOOK.md`.
+4. **Live-validate then tear down** (acceptance below).
+
+**Acceptance:** Claude Code connects to `https://<domain>/mcp` with a Cognito
+bearer, `list_projects`/`switch_project`/an analysis tool round-trip, two
+concurrent users hold **independent** active projects, and an unauthenticated
+`/mcp` request is rejected (401/close) — live-validated on the custom domain,
+then torn down. Local stdio MCP + the suite stay unchanged (HTTP path is opt-in).
+
+> Note the related but distinct **WebSocket** gap: emulation/terminal WS were
+> hardened in the security review (§11) to require a token, but they remain
+> out-of-scope features in the cloud build (no `docker.sock`/privileged worker in
+> Fargate). Remote MCP does **not** depend on them.
+
 ---
 
 ## 7. Shared-team-instance requirements (don't forget)
@@ -615,7 +715,9 @@ seam is in place (`identity_providers`).
 This is a **multi-user** deployment (Cognito-fronted). Therefore:
 - Backend is stateless and autoscaled (1..N) — all state in Aurora/Redis/EFS.
 - The MCP empty-state + `switch_project` model already supports many users on
-  one server; preserve it.
+  one server; preserve it. **Caveat:** that holds per-*process* (one stdio MCP
+  per user). The remote HTTP transport must move `ProjectState` to per-session —
+  see Phase 5b — or concurrent users stomp each other's active project.
 - **Job concurrency cap** at the `SubmitJob` site so one analyst can't saturate
   the Batch queue — ✅ DONE as a **per-firmware** cap (§4c), the identity
   available at every dispatch site; jobs tagged `wairz:firmware`. Per-*user*

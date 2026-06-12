@@ -1,26 +1,40 @@
 """Wairz MCP Server — exposes firmware analysis tools via the Model Context Protocol.
 
 Usage:
-    wairz-mcp --project-id <uuid> [--firmware-id <uuid>]
+    wairz-mcp --project-id <uuid> [--firmware-id <uuid>]        # stdio (default)
+    wairz-mcp --transport http [--host 0.0.0.0 --port 8765]      # Streamable HTTP
 
 Connects to the Wairz database, loads the specified project and firmware,
-then serves all registered analysis tools over stdio for MCP-compatible
-clients (Claude Code, Claude Desktop, OpenCode, etc.).
+then serves all registered analysis tools to MCP-compatible clients
+(Claude Code, Claude Desktop, OpenCode, etc.).
 
-When a project has multiple firmware versions, --firmware-id selects a
+Two transports share one server build (`build_mcp_server`):
+
+  * **stdio** — one client per process. A single preloaded ``ProjectState`` is
+    shared by every request and mutated in place; ``--project-id`` selects the
+    active project up front and ``switch_project`` changes it without a restart.
+
+  * **http** — Streamable HTTP for the multi-user cloud deploy (Phase 5). Many
+    clients hit one server; each MCP session gets its *own* ``ProjectState``
+    (keyed by the per-session transport), so concurrent users hold independent
+    active projects. Sessions start empty and pick a project via
+    ``list_projects`` + ``switch_project``. Bearer-token auth (the same Cognito
+    OIDC verifier as the REST API) gates the endpoint when ``auth_enabled``.
+
+When a project has multiple firmware versions, --firmware-id (stdio) selects a
 specific one. Without it, the earliest-uploaded unpacked firmware is used.
-
-Supports dynamic project switching via the switch_project tool — no need
-to restart the MCP server process when changing projects.
 """
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
+import json
 import logging
 import os
 import sys
 import uuid
+import weakref
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -72,6 +86,9 @@ class ProjectState:
     All MCP handler closures reference a single instance of this class.
     The switch_project tool updates it in-place to change the active project
     without restarting the MCP server process.
+
+    In the HTTP transport there is one ProjectState *per MCP session* rather
+    than one per process, so concurrent users never share an active project.
     """
 
     project_id: uuid.UUID = field(default_factory=lambda: uuid.UUID(int=0))
@@ -407,124 +424,90 @@ async def _load_project_state(
     return firmware_count
 
 
-async def run_server(
-    project_id: uuid.UUID | None,
-    firmware_id: uuid.UUID | None = None,
-) -> None:
-    """Start the MCP server.
+def _make_session_factory() -> async_sessionmaker:
+    """Build a standalone async session factory for the MCP process.
 
-    When *project_id* is None the server starts with no active project; the
-    agent is expected to call list_projects + switch_project to pick one
-    before invoking analysis tools.
+    Deliberately not the FastAPI module-level engine — the MCP server (stdio or
+    its own HTTP process) owns its connection pool.
     """
     settings = get_settings()
-
-    # Create a standalone async engine (not sharing the FastAPI module-level one)
     engine = create_async_engine(settings.database_url, echo=False)
-    session_factory = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
-    )
+    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    # Resolve host-side storage root once at startup
-    host_storage_root = _resolve_storage_root()
-    if host_storage_root:
-        logger.info(
-            "Path translation active: %s → %s",
-            DOCKER_STORAGE_ROOT,
-            host_storage_root,
-        )
 
-    # Mutable state object — all closures reference this single instance.
-    # switch_project updates it in-place.
-    state = ProjectState()
+def build_mcp_server(
+    session_factory: async_sessionmaker,
+    host_storage_root: str | None,
+    *,
+    shared_state: ProjectState | None = None,
+    default_project_id: uuid.UUID | None = None,
+    default_firmware_id: uuid.UUID | None = None,
+) -> Server:
+    """Construct the MCP ``Server`` with all tools, resources, and prompts.
 
-    # Load initial project, if one was specified. When project_id is None the
-    # server boots in "no project" mode — the agent must use list_projects +
-    # switch_project before any analysis tool can be called.
-    if project_id is None:
-        logger.info(
-            "Starting with no active project. Use list_projects and "
-            "switch_project to select one."
-        )
-    else:
-        try:
-            firmware_count = await _load_project_state(
-                session_factory, project_id, state, host_storage_root, firmware_id
-            )
-        except ValueError as exc:
-            logger.error(str(exc))
-            sys.exit(1)
+    State model — the one thing that differs between transports:
 
-        if not state.firmware_loaded:
-            if firmware_count == 0:
-                logger.warning(
-                    "Project '%s' has no firmware uploaded. The MCP server will start, "
-                    "but analysis tools will not work until firmware is uploaded and "
-                    "unpacked. Use the Wairz web UI or POST /api/v1/projects/%s/firmware "
-                    "to upload firmware.",
-                    state.project_name,
-                    project_id,
-                )
-            else:
-                logger.warning(
-                    "Project '%s' has %d firmware(s), but none have been unpacked. "
-                    "The MCP server will start, but analysis tools will not work until "
-                    "firmware is unpacked. Trigger unpack via the web UI or "
-                    "POST /api/v1/projects/%s/firmware/<id>/unpack.",
-                    state.project_name,
-                    firmware_count,
-                    project_id,
-                )
-        else:
-            if firmware_count > 1 and firmware_id is None:
-                logger.info(
-                    "Project has %d firmware versions; selected '%s' (%s) as the active firmware. "
-                    "Pass --firmware-id <uuid> to select a different one, or use the "
-                    "list_firmware_versions MCP tool to see all versions.",
-                    firmware_count,
-                    state.firmware_filename,
-                    state.firmware_id,
-                )
+      * **stdio:** pass ``shared_state`` (a single preloaded ProjectState). Every
+        request returns that same instance and mutates it in place — identical
+        to the original single-process behavior.
 
-            # RTOS/unknown firmware has no rootfs — skip the directory check and
-            # rely on storage_path instead. We still validate when extracted_path
-            # is set (Linux case).
-            if state.extracted_path and not os.path.isdir(state.extracted_path):
-                logger.error(
-                    "Extracted firmware path does not exist: %s",
-                    state.extracted_path,
-                )
-                logger.error(
-                    "The database stores Docker-internal paths. To fix this, either:\n"
-                    "  1. Run the MCP server inside Docker:\n"
-                    "     docker exec -i wairz-backend-1 uv run wairz-mcp --project-id %s\n"
-                    "  2. Set STORAGE_ROOT in .env to point to a local copy of the firmware data",
-                    project_id,
-                )
-                sys.exit(1)
-            if not state.extracted_path and state.storage_path and not os.path.isfile(state.storage_path):
-                logger.error(
-                    "Firmware storage path does not exist: %s",
-                    state.storage_path,
-                )
-                sys.exit(1)
+      * **http:** pass ``shared_state=None``. Each MCP session gets its own
+        ProjectState, looked up by the per-session ``ServerSession`` so two
+        users never clobber each other's active project (Phase 5b).
+        ``default_project_id`` is normally None for HTTP (sessions start empty
+        and call list_projects/switch_project); it exists mainly for tests.
 
-            logger.info(
-                "Loaded project '%s' — firmware: %s (%s, %s)",
-                state.project_name,
-                state.firmware_filename,
-                state.architecture or "unknown arch",
-                state.endianness or "unknown endian",
-            )
-            logger.info("Firmware root: %s", state.extracted_path)
-
-    # Build tool registry
+    Returns the configured server; the caller runs it over a transport.
+    """
+    server = Server("wairz")
     registry = _build_tool_registry()
+
+    # Per-session ProjectState for the HTTP transport. WeakKeyDictionary so a
+    # session's state is dropped automatically when the session ends and its
+    # ServerSession is garbage-collected — no manual cleanup, no leak.
+    _session_states: "weakref.WeakKeyDictionary[object, ProjectState]" = (
+        weakref.WeakKeyDictionary()
+    )
+    # Exposed for observability/tests: maps live ServerSession → its ProjectState
+    # (empty in stdio/shared_state mode). Not part of the MCP protocol.
+    server._wairz_session_states = _session_states
+
+    async def _state() -> ProjectState:
+        """Resolve the ProjectState for the in-flight request.
+
+        stdio → the shared instance. http → this session's instance (created on
+        first use, optionally preloaded with the default project).
+        """
+        if shared_state is not None:
+            return shared_state
+        # request_context is set by the SDK for the duration of a request; its
+        # .session is the per-MCP-session handle and is stable across the
+        # session's lifetime in stateful Streamable HTTP.
+        session = server.request_context.session
+        st = _session_states.get(session)
+        if st is None:
+            st = ProjectState()
+            if default_project_id is not None:
+                try:
+                    await _load_project_state(
+                        session_factory,
+                        default_project_id,
+                        st,
+                        host_storage_root,
+                        default_firmware_id,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Default project load failed for new MCP session: %s", exc
+                    )
+            _session_states[session] = st
+        return st
 
     # --- Register MCP-only project management tools ---
 
     async def _handle_get_project_info(input: dict, context: ToolContext) -> str:
         """Return info about the currently active project."""
+        state = await _state()
         if state.project_id == uuid.UUID(int=0):
             return (
                 "No project is active. Call list_projects to see what's "
@@ -571,6 +554,7 @@ async def run_server(
 
     async def _handle_switch_project(input: dict, context: ToolContext) -> str:
         """Switch the MCP server to a different project without restarting."""
+        state = await _state()
         new_project_id_str = input.get("project_id", "")
         if not new_project_id_str:
             return "Error: project_id is required."
@@ -649,7 +633,8 @@ async def run_server(
 
         # If the firmware kind changed, the visible tool set changes too —
         # tell the client to re-fetch list_tools so kind-tagged tools come
-        # and go without requiring an MCP reconnect.
+        # and go without requiring an MCP reconnect. request_context.session is
+        # this caller's session, so the notification targets only them.
         if state.firmware_kind != old_kind:
             try:
                 await server.request_context.session.send_tool_list_changed()
@@ -710,6 +695,7 @@ async def run_server(
 
     async def _handle_list_projects(input: dict, context: ToolContext) -> str:
         """List all available projects."""
+        state = await _state()
         async with session_factory() as session:
             stmt = select(Project).order_by(Project.created_at.desc())
             result = await session.execute(stmt)
@@ -742,17 +728,26 @@ async def run_server(
         handler=_handle_list_projects,
     )
 
-    tool_count = len(registry._tools)
-    logger.info("Registered %d tools.", tool_count)
+    logger.info("Registered %d tools.", len(registry._tools))
 
-    # Create MCP server
-    server = Server("wairz")
+    # Tools that work without firmware loaded
+    _NO_FIRMWARE_TOOLS = {
+        "get_project_info", "switch_project", "list_projects",
+        "list_firmware_versions",
+    }
+
+    # Tools that mutate the active firmware's unpack metadata; after these run
+    # the cached ProjectState must be reloaded from the DB.
+    _STATE_REFRESHING_TOOLS = {
+        "set_firmware_arch", "set_rootfs", "set_kernel", "redetect",
+    }
 
     # --- Tool listing ---
     # Filter dynamically on each call so switch_project (which mutates state
     # in place) immediately changes the visible tool surface.
     @server.list_tools()
     async def list_tools() -> list[Tool]:
+        state = await _state()
         kind = state.firmware_kind
         tools = []
         for tool_def in registry._tools.values():
@@ -767,23 +762,12 @@ async def run_server(
             )
         return tools
 
-    # Tools that work without firmware loaded
-    _NO_FIRMWARE_TOOLS = {
-        "get_project_info", "switch_project", "list_projects",
-        "list_firmware_versions",
-    }
-
-    # Tools that mutate the active firmware's unpack metadata; after these run
-    # the cached ProjectState must be reloaded from the DB.
-    _STATE_REFRESHING_TOOLS = {
-        "set_firmware_arch", "set_rootfs", "set_kernel", "redetect",
-    }
-
     # --- Tool dispatch ---
     @server.call_tool()
     async def call_tool(
         name: str, arguments: dict
     ) -> list[TextContent]:
+        state = await _state()
         if not state.firmware_loaded and name not in _NO_FIRMWARE_TOOLS:
             if state.project_id == uuid.UUID(int=0):
                 return [TextContent(
@@ -870,6 +854,7 @@ async def run_server(
     @server.read_resource()
     async def read_resource(uri) -> str:
         if str(uri) == "wairz://project/info":
+            state = await _state()
             kind_label = state.firmware_kind
             if state.firmware_kind == "rtos" and state.rtos_flavor:
                 kind_label = f"rtos ({state.rtos_flavor})"
@@ -905,6 +890,7 @@ async def run_server(
         name: str, arguments: dict[str, str] | None
     ) -> GetPromptResult:
         if name == "firmware-analysis":
+            state = await _state()
             prompt_text = build_system_prompt(
                 project_name=state.project_name,
                 firmware_filename=state.firmware_filename,
@@ -925,21 +911,230 @@ async def run_server(
             )
         raise ValueError(f"Unknown prompt: {name}")
 
-    # --- Run ---
-    logger.info("Starting Wairz MCP server (stdio transport)...")
-    # Advertise list-changed support in the server capabilities so clients
-    # subscribe to notifications/tools/list_changed (emitted from
-    # switch_project when the active firmware kind changes the visible
-    # tool set).
-    init_options = server.create_initialization_options(
+    return server
+
+
+def _stdio_init_options(server: Server):
+    """Initialization options advertising list-changed support (stdio)."""
+    return server.create_initialization_options(
         notification_options=NotificationOptions(
             tools_changed=True,
             resources_changed=True,
             prompts_changed=True,
         ),
     )
+
+
+async def run_server(
+    project_id: uuid.UUID | None,
+    firmware_id: uuid.UUID | None = None,
+) -> None:
+    """Start the MCP server over **stdio** (one client per process).
+
+    When *project_id* is None the server starts with no active project; the
+    agent is expected to call list_projects + switch_project to pick one
+    before invoking analysis tools.
+    """
+    session_factory = _make_session_factory()
+
+    # Resolve host-side storage root once at startup
+    host_storage_root = _resolve_storage_root()
+    if host_storage_root:
+        logger.info(
+            "Path translation active: %s → %s",
+            DOCKER_STORAGE_ROOT,
+            host_storage_root,
+        )
+
+    # Single shared state object for the stdio process — every request mutates
+    # this one instance (switch_project updates it in place).
+    state = ProjectState()
+
+    # Load initial project, if one was specified. When project_id is None the
+    # server boots in "no project" mode — the agent must use list_projects +
+    # switch_project before any analysis tool can be called.
+    if project_id is None:
+        logger.info(
+            "Starting with no active project. Use list_projects and "
+            "switch_project to select one."
+        )
+    else:
+        try:
+            firmware_count = await _load_project_state(
+                session_factory, project_id, state, host_storage_root, firmware_id
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+
+        if not state.firmware_loaded:
+            if firmware_count == 0:
+                logger.warning(
+                    "Project '%s' has no firmware uploaded. The MCP server will start, "
+                    "but analysis tools will not work until firmware is uploaded and "
+                    "unpacked. Use the Wairz web UI or POST /api/v1/projects/%s/firmware "
+                    "to upload firmware.",
+                    state.project_name,
+                    project_id,
+                )
+            else:
+                logger.warning(
+                    "Project '%s' has %d firmware(s), but none have been unpacked. "
+                    "The MCP server will start, but analysis tools will not work until "
+                    "firmware is unpacked. Trigger unpack via the web UI or "
+                    "POST /api/v1/projects/%s/firmware/<id>/unpack.",
+                    state.project_name,
+                    firmware_count,
+                    project_id,
+                )
+        else:
+            if firmware_count > 1 and firmware_id is None:
+                logger.info(
+                    "Project has %d firmware versions; selected '%s' (%s) as the active firmware. "
+                    "Pass --firmware-id <uuid> to select a different one, or use the "
+                    "list_firmware_versions MCP tool to see all versions.",
+                    firmware_count,
+                    state.firmware_filename,
+                    state.firmware_id,
+                )
+
+            # RTOS/unknown firmware has no rootfs — skip the directory check and
+            # rely on storage_path instead. We still validate when extracted_path
+            # is set (Linux case).
+            if state.extracted_path and not os.path.isdir(state.extracted_path):
+                logger.error(
+                    "Extracted firmware path does not exist: %s",
+                    state.extracted_path,
+                )
+                logger.error(
+                    "The database stores Docker-internal paths. To fix this, either:\n"
+                    "  1. Run the MCP server inside Docker:\n"
+                    "     docker exec -i wairz-backend-1 uv run wairz-mcp --project-id %s\n"
+                    "  2. Set STORAGE_ROOT in .env to point to a local copy of the firmware data",
+                    project_id,
+                )
+                sys.exit(1)
+            if not state.extracted_path and state.storage_path and not os.path.isfile(state.storage_path):
+                logger.error(
+                    "Firmware storage path does not exist: %s",
+                    state.storage_path,
+                )
+                sys.exit(1)
+
+            logger.info(
+                "Loaded project '%s' — firmware: %s (%s, %s)",
+                state.project_name,
+                state.firmware_filename,
+                state.architecture or "unknown arch",
+                state.endianness or "unknown endian",
+            )
+            logger.info("Firmware root: %s", state.extracted_path)
+
+    server = build_mcp_server(session_factory, host_storage_root, shared_state=state)
+
+    logger.info("Starting Wairz MCP server (stdio transport)...")
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, init_options)
+        await server.run(read_stream, write_stream, _stdio_init_options(server))
+
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP transport (Phase 5) — multi-user, Cognito-gated.
+# ---------------------------------------------------------------------------
+
+
+async def _send_json_asgi(send, status: int, payload: dict) -> None:
+    """Emit a one-shot JSON response over raw ASGI (for the auth 401)."""
+    body = json.dumps(payload).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+def build_http_app(path: str = "/mcp"):
+    """Build the Streamable HTTP ASGI app for the multi-user cloud transport.
+
+    Returns a Starlette app that serves the MCP server at *path*. Each MCP
+    session gets its own ProjectState (per-session, not per-process). When
+    ``settings.auth_enabled`` the endpoint requires a valid bearer token,
+    verified by the *same* OIDC/Cognito verifier as the REST API.
+
+    Runs as its own ASGI app (e.g. ``wairz-mcp --transport http``, served by
+    uvicorn) rather than mounted into the FastAPI app — that keeps the MCP
+    streaming responses out of the REST app's BaseHTTPMiddleware chain (which
+    buffers and would stall SSE), and lets it run as a sidecar that shares the
+    backend task's EFS mount, database, and OIDC env.
+    """
+    from starlette.applications import Starlette
+    from starlette.concurrency import run_in_threadpool
+    from starlette.routing import Mount
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    from app.auth.oidc import AuthError, get_verifier
+
+    session_factory = _make_session_factory()
+    host_storage_root = _resolve_storage_root()
+
+    server = build_mcp_server(
+        session_factory,
+        host_storage_root,
+        shared_state=None,
+        default_project_id=None,
+    )
+
+    # Stateful sessions: each Mcp-Session-Id keeps a live ServerSession (and so
+    # its own ProjectState) across requests, and server→client notifications
+    # (tools/list_changed from switch_project) can be delivered.
+    manager = StreamableHTTPSessionManager(
+        app=server, json_response=False, stateless=False
+    )
+
+    verifier = get_verifier()
+    if verifier is None:
+        logger.warning(
+            "MCP HTTP transport starting WITHOUT auth (settings.auth_enabled is "
+            "false). Do not expose this on an untrusted network."
+        )
+    else:
+        logger.info("MCP HTTP transport: bearer-token auth enabled (issuer %s).", verifier.issuer)
+
+    async def mcp_asgi(scope, receive, send):
+        # Auth gate (HTTP only). The same Cognito access token the SPA sends to
+        # the REST API authorizes the MCP endpoint.
+        if scope["type"] == "http" and verifier is not None:
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])
+            }
+            header = headers.get("authorization", "")
+            token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+            authorized = False
+            if token:
+                try:
+                    await run_in_threadpool(verifier.verify, token)
+                    authorized = True
+                except AuthError:
+                    authorized = False
+            if not authorized:
+                await _send_json_asgi(
+                    send, 401, {"detail": "missing or invalid bearer token"}
+                )
+                return
+        await manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        # The session manager's task group must be live for handle_request.
+        async with manager.run():
+            logger.info("MCP Streamable HTTP transport ready at %s", path)
+            yield
+
+    return Starlette(routes=[Mount(path, app=mcp_asgi)], lifespan=lifespan)
 
 
 def main() -> None:
@@ -948,13 +1143,42 @@ def main() -> None:
         description="Wairz MCP Server — firmware analysis tools over MCP",
     )
     parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help=(
+            "Transport: 'stdio' (default — one client per process, for Claude "
+            "Desktop/Code locally) or 'http' (Streamable HTTP — multi-user, for "
+            "the cloud deploy behind Cognito). --project-id/--firmware-id apply "
+            "to stdio only; HTTP sessions start empty and use switch_project."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="HTTP bind host (http transport only). Default 0.0.0.0.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="HTTP bind port (http transport only). Default 8765.",
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default="/mcp",
+        help="HTTP route path the MCP endpoint is served at (http transport). Default /mcp.",
+    )
+    parser.add_argument(
         "--project-id",
         type=str,
         default=None,
         help=(
-            "UUID of the project to analyze. Optional — when omitted, the "
-            "server starts with no active project and the agent should call "
-            "list_projects + switch_project to pick one."
+            "UUID of the project to analyze (stdio only). Optional — when "
+            "omitted, the server starts with no active project and the agent "
+            "should call list_projects + switch_project to pick one."
         ),
     )
     parser.add_argument(
@@ -962,7 +1186,7 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "UUID of a specific firmware version within the project. "
+            "UUID of a specific firmware version within the project (stdio only). "
             "Optional — when omitted, the earliest-uploaded unpacked firmware "
             "is selected. Use list_firmware_versions (MCP tool) or the project "
             "detail page in the web UI to find firmware IDs. Ignored when "
@@ -970,6 +1194,19 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.transport == "http":
+        # Multi-user HTTP server; project context is per-session, not a CLI arg.
+        import uvicorn
+
+        logger.info(
+            "Starting Wairz MCP server (Streamable HTTP) on %s:%d%s",
+            args.host,
+            args.port,
+            args.path,
+        )
+        uvicorn.run(build_http_app(path=args.path), host=args.host, port=args.port)
+        return
 
     project_id: uuid.UUID | None = None
     if args.project_id is not None:
