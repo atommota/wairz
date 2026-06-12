@@ -45,12 +45,23 @@ resource "aws_iam_role" "task" {
 # The backend dispatches Ghidra work to Batch.
 data "aws_iam_policy_document" "task_batch" {
   statement {
-    actions   = ["batch:SubmitJob"]
-    resources = [var.batch_job_queue, "${var.batch_job_definition_arn}*"]
+    actions = ["batch:SubmitJob"]
+    resources = [
+      var.batch_job_queue,
+      # Scope to the job-definition FAMILY, not one pinned revision. The input
+      # ARN carries a ":<revision>" suffix (e.g. ...:16); the dispatcher submits
+      # by NAME, which IAM authorizes against the un-revisioned family ARN — so a
+      # "...:16*" resource denies it. Strip the revision, then wildcard, to match
+      # the bare family ARN and every revision.
+      "${replace(var.batch_job_definition_arn, "/:[0-9]+$/", "")}*",
+    ]
   }
   statement {
-    actions   = ["batch:DescribeJobs", "batch:ListJobs", "batch:TerminateJob"]
-    resources = ["*"] # these Batch actions don't support resource-level scoping
+    # TagResource is required because the dispatcher submits jobs WITH tags
+    # (tag-on-create) — without it SubmitJob fails with an AccessDenied on
+    # batch:TagResource. These actions don't support resource-level scoping.
+    actions   = ["batch:DescribeJobs", "batch:ListJobs", "batch:TerminateJob", "batch:TagResource"]
+    resources = ["*"]
   }
 }
 
