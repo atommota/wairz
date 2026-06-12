@@ -48,6 +48,17 @@ cognito_domain_suffix = "auth"
 # Set an email to receive alarm notifications (confirm via the AWS email).
 alarm_email = ""
 
+# --- Custom domain + auth ---------------------------------------------------
+# Serve on your own domain (ACM cert DNS-validated in your Route53 zone +
+# CloudFront alias). Empty = the default *.cloudfront.net domain.
+domain_name     = "" # e.g. "wairz.example.com"
+route53_zone_id = "" # hosted zone that owns domain_name; required if domain_name set
+# Enforce Cognito login: the SPA requires sign-in and the API requires a bearer
+# token. Requires domain_name. IdP-agnostic — to put the pool behind external
+# SSO (JumpCloud/Okta/…), federate it into the Cognito pool and add the provider
+# name to the auth module's identity_providers.
+auth_enabled = false
+
 # --- Application ------------------------------------------------------------
 # Max firmware upload size (MB). Plumbs to backend + ALB + CloudFront limits.
 max_upload_size_mb = 500

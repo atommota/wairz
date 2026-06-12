@@ -24,9 +24,58 @@ provider "aws" {
   }
 }
 
+# CloudFront ACM certs must live in us-east-1 regardless of the deployment
+# region; this aliased provider creates the custom-domain cert there.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+
+  default_tags {
+    tags = merge(
+      {
+        Project     = "wairz"
+        Environment = var.environment
+        ManagedBy   = "terraform"
+      },
+      var.tags,
+    )
+  }
+}
+
 locals {
   # Canonical name prefix for all resources, e.g. "wairz-prod".
   name = "${var.name_prefix}-${var.environment}"
+
+  # The app's public origin (custom domain if set, else the CloudFront domain).
+  app_url = var.domain_name != "" ? "https://${var.domain_name}" : "https://${module.frontend.cloudfront_domain}"
+
+  # OIDC issuer for the deployment's Cognito user pool. An operator can override
+  # the backend's view of this to point at another issuer, but by default the
+  # SPA logs in to this pool (which can itself federate an external IdP).
+  oidc_issuer = "https://cognito-idp.${var.aws_region}.amazonaws.com/${module.auth.user_pool_id}"
+
+  # Cognito OAuth redirect/sign-out URLs. Keyed off the *input* domain_name (not
+  # the frontend output) to avoid a backend→auth→frontend→backend cycle; a
+  # localhost entry keeps the client valid when no domain is set and helps local
+  # SPA dev. auth_enabled requires a real domain (precondition below).
+  app_callback_urls = compact([
+    var.domain_name != "" ? "https://${var.domain_name}/callback" : "",
+    "http://localhost:3000/callback",
+  ])
+  app_logout_urls = compact([
+    var.domain_name != "" ? "https://${var.domain_name}/" : "",
+    "http://localhost:3000/",
+  ])
+}
+
+# auth_enabled needs a stable redirect domain.
+resource "terraform_data" "auth_requires_domain" {
+  lifecycle {
+    precondition {
+      condition     = !var.auth_enabled || var.domain_name != ""
+      error_message = "auth_enabled requires domain_name (the OIDC redirect URI must be on a stable custom domain)."
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -40,6 +89,9 @@ module "network" {
   aws_region         = var.aws_region
   vpc_cidr           = var.vpc_cidr
   create_nat_gateway = var.create_nat_gateway
+  # With auth on and no NAT, the backend needs the Cognito JWKS endpoint
+  # reachable privately to validate tokens.
+  extra_interface_endpoints = var.auth_enabled && !var.create_nat_gateway ? ["cognito-idp"] : []
 }
 
 module "storage" {
@@ -112,6 +164,10 @@ module "backend" {
   max_upload_size_mb          = var.max_upload_size_mb
   certificate_arn             = var.alb_certificate_arn
   batch_max_jobs_per_firmware = var.batch_max_jobs_per_firmware
+
+  auth_enabled  = var.auth_enabled
+  oidc_issuer   = var.auth_enabled ? local.oidc_issuer : ""
+  oidc_audience = var.auth_enabled ? module.auth.client_id : ""
 }
 
 module "frontend" {
@@ -122,14 +178,17 @@ module "frontend" {
   spa_bucket_arn                  = module.storage.spa_bucket_arn
   spa_bucket_regional_domain_name = module.storage.spa_bucket_regional_domain_name
   alb_dns_name                    = module.backend.alb_dns_name
+
+  aliases             = var.domain_name != "" ? [var.domain_name] : []
+  acm_certificate_arn = var.domain_name != "" ? aws_acm_certificate_validation.cf[0].certificate_arn : ""
 }
 
 module "auth" {
   source        = "./modules/auth"
   name          = local.name
   domain_suffix = var.cognito_domain_suffix
-  callback_urls = ["https://${module.frontend.cloudfront_domain}/oauth2/idpresponse"]
-  logout_urls   = ["https://${module.frontend.cloudfront_domain}/"]
+  callback_urls = local.app_callback_urls
+  logout_urls   = local.app_logout_urls
 }
 
 module "observability" {

@@ -186,6 +186,10 @@ resource "aws_ecs_task_definition" "this" {
       { name = "BATCH_JOB_DEFINITION", value = var.batch_job_definition_name },
       { name = "BATCH_MAX_JOBS_PER_FIRMWARE", value = tostring(var.batch_max_jobs_per_firmware) },
       { name = "MAX_UPLOAD_SIZE_MB", value = tostring(var.max_upload_size_mb) },
+      # OIDC auth (no-op unless AUTH_ENABLED=true).
+      { name = "AUTH_ENABLED", value = tostring(var.auth_enabled) },
+      { name = "OIDC_ISSUER", value = var.oidc_issuer },
+      { name = "OIDC_AUDIENCE", value = var.oidc_audience },
       # Host/origin guard: behind CloudFront/ALB (+ Cognito) the Host varies, so
       # default to permissive. Tighten to the specific CloudFront/custom domain
       # in production if you want DNS-rebinding protection at the app layer too.

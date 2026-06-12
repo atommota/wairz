@@ -26,3 +26,9 @@ variable "logout_urls" {
   default     = []
   description = "OAuth logout URLs."
 }
+
+variable "identity_providers" {
+  type        = list(string)
+  default     = ["COGNITO"]
+  description = "Cognito-supported IdPs for the app client. Add a federated SAML/OIDC provider name (e.g. an operator's JumpCloud) to put the pool behind external SSO."
+}

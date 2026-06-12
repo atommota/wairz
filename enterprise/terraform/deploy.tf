@@ -62,6 +62,8 @@ resource "null_resource" "spa" {
     image_tag       = local.image_tag
     bucket          = module.storage.spa_bucket
     distribution_id = module.frontend.distribution_id
+    # Re-publish config.json when the auth wiring changes.
+    auth = "${var.auth_enabled}:${var.auth_enabled ? local.oidc_issuer : ""}:${var.auth_enabled ? module.auth.client_id : ""}"
   }
 
   provisioner "local-exec" {
@@ -71,6 +73,11 @@ resource "null_resource" "spa" {
       AWS_REGION      = var.aws_region
       SPA_BUCKET      = module.storage.spa_bucket
       DISTRIBUTION_ID = module.frontend.distribution_id
+      # Auth: deploy-spa.sh writes dist/config.json from these (no-op unless on).
+      AUTH_ENABLED   = tostring(var.auth_enabled)
+      OIDC_AUTHORITY = var.auth_enabled ? local.oidc_issuer : ""
+      OIDC_CLIENT_ID = var.auth_enabled ? module.auth.client_id : ""
+      COGNITO_DOMAIN = var.auth_enabled ? "https://${module.auth.hosted_ui_domain}.auth.${var.aws_region}.amazoncognito.com" : ""
     }
   }
 }

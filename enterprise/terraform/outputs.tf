@@ -49,7 +49,12 @@ output "ghidra_ecr_repository_url" {
 
 # --- Phase 3: serving layer -------------------------------------------------
 output "app_url" {
-  description = "CloudFront URL serving the Wairz SPA + API."
+  description = "URL serving the Wairz SPA + API (custom domain if set, else CloudFront)."
+  value       = local.app_url
+}
+
+output "cloudfront_url" {
+  description = "Always the underlying CloudFront URL (useful while DNS/cert propagate)."
   value       = "https://${module.frontend.cloudfront_domain}"
 }
 
@@ -74,6 +79,16 @@ output "cognito_user_pool_id" {
 
 output "cognito_hosted_ui_domain" {
   value = module.auth.hosted_ui_domain
+}
+
+output "cognito_app_client_id" {
+  description = "Cognito app client id (the SPA's OIDC client / token audience)."
+  value       = module.auth.client_id
+}
+
+output "auth_enabled" {
+  description = "Whether OIDC login is enforced on this deployment."
+  value       = var.auth_enabled
 }
 
 # --- Phase 4: observability -------------------------------------------------

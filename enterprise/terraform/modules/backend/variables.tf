@@ -83,6 +83,24 @@ variable "batch_max_jobs_per_firmware" {
   description = "Per-firmware in-flight Batch job cap enforced by the backend at SubmitJob (shared-instance fairness). 0 disables."
 }
 
+variable "auth_enabled" {
+  type        = bool
+  default     = false
+  description = "Enforce OIDC bearer-token auth on the HTTP API."
+}
+
+variable "oidc_issuer" {
+  type        = string
+  default     = ""
+  description = "OIDC issuer URL the backend validates tokens against (the Cognito pool by default)."
+}
+
+variable "oidc_audience" {
+  type        = string
+  default     = ""
+  description = "Expected token audience / client id."
+}
+
 variable "allowed_hosts" {
   type        = string
   default     = "*"

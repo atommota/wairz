@@ -83,6 +83,25 @@ variable "alarm_email" {
   default     = ""
 }
 
+# --- Custom domain + auth ---------------------------------------------------
+variable "domain_name" {
+  description = "Custom domain for the app (e.g. wairz.example.com). Empty = serve on the default CloudFront domain. Provisions an ACM cert (DNS-validated in route53_zone_id) and a Route53 alias to CloudFront."
+  type        = string
+  default     = ""
+}
+
+variable "route53_zone_id" {
+  description = "Route53 hosted zone id that owns domain_name (for ACM DNS validation + the alias record). Required when domain_name is set."
+  type        = string
+  default     = ""
+}
+
+variable "auth_enabled" {
+  description = "Enforce Cognito/OIDC login: the SPA requires sign-in and the API requires a bearer token. Requires domain_name (the OIDC redirect URI needs a stable domain). IdP-agnostic — federate an external IdP (JumpCloud/Okta) into the Cognito pool for SSO."
+  type        = bool
+  default     = false
+}
+
 # --- Application sizing / behavior knobs ------------------------------------
 
 variable "max_upload_size_mb" {

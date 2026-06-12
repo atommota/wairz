@@ -19,3 +19,9 @@ variable "create_nat_gateway" {
   type        = bool
   default     = false
 }
+
+variable "extra_interface_endpoints" {
+  description = "Additional interface VPC endpoint service short-names (e.g. \"cognito-idp\"). Only created on the no-NAT path."
+  type        = list(string)
+  default     = []
+}

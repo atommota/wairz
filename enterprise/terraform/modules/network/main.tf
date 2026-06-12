@@ -130,7 +130,7 @@ resource "aws_vpc_endpoint" "s3" {
 # Interface endpoints: ECR (api + dkr), Secrets Manager, CloudWatch Logs, STS.
 # These let Fargate/Batch pull images, read secrets, and log without NAT.
 locals {
-  interface_endpoints = toset([
+  interface_endpoints = toset(concat([
     "ecr.api",
     "ecr.dkr",
     "secretsmanager",
@@ -143,15 +143,30 @@ locals {
     "ecs",
     "ecs-agent",
     "ecs-telemetry",
-  ])
+    # Caller-supplied extras (e.g. "cognito-idp" so the backend can fetch the
+    # OIDC JWKS privately when auth is enabled). No-op under NAT (for_each below
+    # is empty then).
+  ], var.extra_interface_endpoints))
+}
+
+# Not every service supports every AZ (e.g. cognito-idp). Look up each service's
+# supported AZs so we only place its endpoint in matching subnets — a single-AZ
+# interface endpoint still serves the whole VPC via private DNS.
+data "aws_vpc_endpoint_service" "interface" {
+  for_each     = var.create_nat_gateway ? toset([]) : local.interface_endpoints
+  service      = each.value
+  service_type = "Interface"
 }
 
 resource "aws_vpc_endpoint" "interface" {
-  for_each            = var.create_nat_gateway ? toset([]) : local.interface_endpoints
-  vpc_id              = aws_vpc.this.id
-  service_name        = "com.amazonaws.${var.aws_region}.${each.value}"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
+  for_each          = var.create_nat_gateway ? toset([]) : local.interface_endpoints
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.aws_region}.${each.value}"
+  vpc_endpoint_type = "Interface"
+  subnet_ids = [
+    for s in aws_subnet.private : s.id
+    if contains(data.aws_vpc_endpoint_service.interface[each.value].availability_zones, s.availability_zone)
+  ]
   security_group_ids  = [aws_security_group.endpoints.id]
   private_dns_enabled = true
   tags                = { Name = "${var.name}-${each.value}" }

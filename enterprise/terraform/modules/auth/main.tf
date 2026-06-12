@@ -33,11 +33,16 @@ resource "aws_cognito_user_pool_client" "this" {
   name         = "${var.name}-web"
   user_pool_id = aws_cognito_user_pool.this.id
 
-  generate_secret                      = true
+  # Public SPA client: Authorization Code + PKCE, no client secret (a browser
+  # can't keep one). PKCE secures the code exchange instead.
+  generate_secret                      = false
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
   allowed_oauth_flows_user_pool_client = true
-  supported_identity_providers         = ["COGNITO"]
+  # COGNITO today; an operator federates their IdP (JumpCloud/Okta/…) by adding
+  # a SAML/OIDC provider to the pool and listing it here. The SPA login flow is
+  # unchanged — Cognito brokers to the IdP.
+  supported_identity_providers = var.identity_providers
 
   callback_urls = var.callback_urls
   logout_urls   = var.logout_urls
