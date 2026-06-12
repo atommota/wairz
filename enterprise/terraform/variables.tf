@@ -108,6 +108,12 @@ variable "mcp_http_enabled" {
   default     = false
 }
 
+variable "mcp_cli_redirect_port" {
+  description = "Loopback port the CLI token helper (enterprise/scripts/wairz_mcp_token.py) uses for its Authorization Code + PKCE redirect. Registered as http://localhost:<port>/callback on the Cognito app client. Change only if the port collides locally."
+  type        = number
+  default     = 51789
+}
+
 variable "users_file" {
   description = "Path (relative to the terraform dir, or absolute) to a YAML list of users to seed into the Cognito pool. Each entry: `- email: a@b.com` with optional `name:`. Only used when auth_enabled (Cognito-native users); absent file = seed nothing. See users.yaml.example."
   type        = string

@@ -147,24 +147,44 @@ mcp_http_enabled = true
 401), the *same* token the SPA obtains. Each MCP session gets its own project
 context, so multiple analysts share one instance without colliding.
 
-**Connect Claude Code** (`.mcp.json` / `claude mcp add`):
+**Connect Claude Code** — use the token helper so the short-lived (~1 h) Cognito
+token refreshes itself. Claude Code's `headersHelper` runs a command on every
+connection and uses the header JSON it prints; `enterprise/scripts/wairz_mcp_token.py`
+is that command (zero deps, Python 3.9+ stdlib only).
 
-```jsonc
-{
-  "mcpServers": {
-    "wairz-cloud": {
-      "type": "http",
-      "url": "https://wairz.example.com/mcp",
-      "headers": { "Authorization": "Bearer <cognito-access-token>" }
-    }
-  }
-}
-```
+1. Point it at your pool (from Terraform outputs) — e.g. in `~/.config/wairz/mcp.json`
+   or as env vars:
+   ```bash
+   export WAIRZ_MCP_COGNITO_DOMAIN=$(terraform output -raw cognito_hosted_ui_domain)
+   export WAIRZ_MCP_REGION=us-east-1
+   export WAIRZ_MCP_CLIENT_ID=$(terraform output -raw cognito_app_client_id)
+   ```
+2. Log in once (browser; works through your federated SSO IdP too). Caches a
+   refresh token (~30 d) under `~/.config/wairz/`:
+   ```bash
+   python3 enterprise/scripts/wairz_mcp_token.py login
+   ```
+3. Wire it into `.mcp.json` (commit-safe — no token in the file):
+   ```jsonc
+   {
+     "mcpServers": {
+       "wairz-cloud": {
+         "type": "http",
+         "url": "https://wairz.example.com/mcp",
+         "headersHelper": "python3 ${CLAUDE_PROJECT_DIR}/enterprise/scripts/wairz_mcp_token.py headers"
+       }
+     }
+   }
+   ```
+   On each connect the helper returns a fresh token from cache (silently
+   refreshing via the refresh-token grant when the access token is stale); you
+   only re-run `login` when the refresh token expires (~monthly). `… token`
+   prints just the access token for manual/env use.
 
-Getting a token: the practical path is to copy the access token the SPA already
-holds after you log in (browser dev-tools → it's the bearer on `/api/*` XHRs),
-or mint one via the Cognito hosted UI / your IdP. Tokens are short-lived
-(~1 h); for a long-running agent, wire a refresh or use a federated IdP session.
+> The loopback redirect (`http://localhost:51789/callback`) must be registered
+> on the Cognito client — Terraform does this via `mcp_cli_redirect_port`
+> (default 51789); change the var + `--port` together if it collides.
+
 The sidecar runs `wairz-mcp --transport http` from the same image and shares the
 task's EFS + DB + OIDC env; it serves an unauthenticated `/healthz` for the ALB
 check only. `essential=false`, so an MCP fault never takes down the REST API.

@@ -696,9 +696,14 @@ multi-user. The work is real but contained to 5a–5c.
    to it; a second ECS-service `load_balancer` block registers the sidecar.
    CloudFront `/mcp*` behavior (uncached, all-viewer, `compress=false` for SSE).
    `modules/backend` + `modules/frontend`. `mcp_url` output.
-3. **Client auth UX** — `docs/RUNBOOK.md` "Remote MCP" section: `.mcp.json`
-   `type:http` + `Authorization: Bearer <cognito-token>`; copy the SPA's token
-   or mint via the hosted UI/IdP.
+3. **Client auth UX** — token helper `enterprise/scripts/wairz_mcp_token.py`
+   (stdlib-only) wired via Claude Code's `headersHelper`: one-time browser
+   `login` (Authorization Code + PKCE through the Cognito hosted UI — SSO-ready)
+   caches a refresh token (~30 d), and `headers` silently mints a fresh access
+   token on each connect (refresh-token grant), so the ~1 h expiry is invisible.
+   Loopback redirect registered via `mcp_cli_redirect_port` (default 51789).
+   12 unit tests (`enterprise/scripts/test_wairz_mcp_token.py`); RUNBOOK
+   documents the `.mcp.json` wiring (no token committed).
 
 **Bug found + fixed during validation:** `Mount("/mcp", …)` serves only `/mcp/`
 and **307-redirects bare `/mcp` → `/mcp/`**; over the network the client drops

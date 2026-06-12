@@ -61,6 +61,10 @@ locals {
   app_callback_urls = compact([
     var.domain_name != "" ? "https://${var.domain_name}/callback" : "",
     "http://localhost:3000/callback",
+    # Loopback redirect for the CLI token helper's Authorization Code + PKCE
+    # login (enterprise/scripts/wairz_mcp_token.py). Cognito requires the exact
+    # URI to be pre-registered.
+    "http://localhost:${var.mcp_cli_redirect_port}/callback",
   ])
   app_logout_urls = compact([
     var.domain_name != "" ? "https://${var.domain_name}/" : "",
