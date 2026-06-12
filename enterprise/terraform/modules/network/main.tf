@@ -143,6 +143,13 @@ locals {
     "ecs",
     "ecs-agent",
     "ecs-telemetry",
+    # The Batch CONTROL-PLANE API: the backend/MCP sidecar calls batch:SubmitJob
+    # + DescribeJobs to dispatch and poll Ghidra analysis. Without this (and no
+    # NAT) those boto3 calls have no route and hang until timeout — blocking the
+    # caller (and the MCP sidecar's event loop → ECS health-check reap) and never
+    # creating a job. Distinct from the "ecs" endpoints above (which are for the
+    # Batch *compute instances*, not the API the dispatcher calls).
+    "batch",
     # Caller-supplied extras (e.g. "cognito-idp" so the backend can fetch the
     # OIDC JWKS privately when auth is enabled). No-op under NAT (for_each below
     # is empty then).

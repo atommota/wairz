@@ -177,19 +177,26 @@ class BatchDispatcher(ComputeDispatcher):
         prefix; paginates each status."""
         client = self._client()
         queue = get_settings().batch_job_queue
+        # The Batch ListJobs API forbids combining `jobStatus` with `filters`
+        # ("...job status are not applicable when ListJobs filters are
+        # specified"). So filter only by the JOB_NAME prefix — that returns this
+        # firmware's jobs in *every* status — and count the active ones from each
+        # summary's own `status` field.
         name_filter = [{"name": "JOB_NAME", "values": [f"wairz-{firmware_token}-*"]}]
+        active = set(_ACTIVE_BATCH_STATUSES)
         total = 0
-        for status in _ACTIVE_BATCH_STATUSES:
-            next_token = None
-            while True:
-                kwargs = {"jobQueue": queue, "jobStatus": status, "filters": name_filter}
-                if next_token:
-                    kwargs["nextToken"] = next_token
-                resp = client.list_jobs(**kwargs)
-                total += len(resp.get("jobSummaryList", []))
-                next_token = resp.get("nextToken")
-                if not next_token:
-                    break
+        next_token = None
+        while True:
+            kwargs = {"jobQueue": queue, "filters": name_filter}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            resp = client.list_jobs(**kwargs)
+            total += sum(
+                1 for j in resp.get("jobSummaryList", []) if j.get("status") in active
+            )
+            next_token = resp.get("nextToken")
+            if not next_token:
+                break
         return total
 
     def _enforce_firmware_cap(self, firmware_id: uuid.UUID) -> None:

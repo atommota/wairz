@@ -75,6 +75,11 @@ resource "aws_cloudfront_distribution" "this" {
       https_port             = 443
       origin_protocol_policy = "http-only" # ALB listener is HTTP; TLS terminates at CloudFront
       origin_ssl_protocols   = ["TLSv1.2"]
+      # MCP tool calls (and some API ops) can run tens of seconds; give the
+      # origin the max default read timeout so they aren't cut to a 504 at the
+      # edge. >60s needs a CloudFront service-quota increase.
+      origin_read_timeout      = 60
+      origin_keepalive_timeout = 60
     }
   }
 

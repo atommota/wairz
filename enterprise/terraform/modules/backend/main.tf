@@ -166,12 +166,17 @@ resource "aws_lb_target_group" "mcp" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # Tolerant on purpose: the MCP sidecar is a single-process event loop, and a
+  # heavy in-process analysis tool can block it for a while. A trigger-happy
+  # check would mark the target unhealthy and make ECS reap the whole task —
+  # killing the user's live MCP session. ~5 min of grace before that happens.
   health_check {
     path                = var.mcp_health_path
     matcher             = "200"
     interval            = 30
+    timeout             = 15
     healthy_threshold   = 2
-    unhealthy_threshold = 5
+    unhealthy_threshold = 10
   }
 }
 

@@ -37,14 +37,14 @@ variable "health_check_path" {
 
 variable "task_cpu" {
   type        = number
-  default     = 512
-  description = "Fargate task CPU units (512 = 0.5 vCPU). Stays small — heavy work is on Batch."
+  default     = 1024
+  description = "Fargate task CPU units (1024 = 1 vCPU). Heavy Ghidra is on Batch, but in-process tools (strings/radare2/binwalk) on large images need real CPU so they don't starve the event loop (and the MCP /healthz)."
 }
 
 variable "task_memory" {
   type        = number
-  default     = 1024
-  description = "Fargate task memory (MiB)."
+  default     = 4096
+  description = "Fargate task memory (MiB). Firmware analysis on large images is memory-hungry; 1 GB OOMs. Must be a valid Fargate combo for task_cpu (1024 vCPU → 2048–8192)."
 }
 
 variable "desired_count" {
