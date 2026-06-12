@@ -1,4 +1,5 @@
 import apiClient from './client'
+import { getAccessToken } from '@/auth/userManager'
 import type {
   EmulationSession,
   EmulationStartRequest,
@@ -78,13 +79,19 @@ export async function getSessionLogs(
   return data.logs
 }
 
-export function buildEmulationTerminalURL(
+export async function buildEmulationTerminalURL(
   projectId: string,
   sessionId: string,
-): string {
+): Promise<string> {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const host = window.location.host
-  return `${proto}//${host}/api/v1/projects/${projectId}/emulation/${sessionId}/terminal`
+  let url = `${proto}//${host}/api/v1/projects/${projectId}/emulation/${sessionId}/terminal`
+  // Pass the auth token on the WS handshake (no-op when auth is disabled).
+  const token = await getAccessToken()
+  if (token) {
+    url += `?access_token=${encodeURIComponent(token)}`
+  }
+  return url
 }
 
 // ── Emulation Presets ──

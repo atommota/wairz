@@ -10,6 +10,7 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from app.auth.oidc import authorize_websocket
 from app.database import async_session_factory
 from app.models.firmware import Firmware
 from app.models.project import Project
@@ -28,6 +29,11 @@ async def websocket_terminal(
     project_id: uuid.UUID,
 ):
     await websocket.accept()
+
+    # Auth: the http middleware can't gate WebSockets, and this endpoint spawns a
+    # shell, so authorize the connection explicitly (no-op when auth is disabled).
+    if await authorize_websocket(websocket) is None:
+        return
 
     # Look up project and firmware extracted_path
     async with async_session_factory() as db:

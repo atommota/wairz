@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.oidc import authorize_websocket
 from app.database import async_session_factory, get_db
 from app.models.emulation_session import EmulationSession
 from app.models.firmware import Firmware
@@ -293,6 +294,11 @@ async def websocket_emulation_terminal(
       - Server sends: { "type": "error", "data": "<message>" }
     """
     await websocket.accept()
+
+    # Auth: WebSockets bypass the http middleware — authorize explicitly
+    # (no-op when auth is disabled).
+    if await authorize_websocket(websocket) is None:
+        return
 
     async with async_session_factory() as db:
         # Validate session

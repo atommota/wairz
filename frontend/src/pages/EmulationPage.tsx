@@ -898,8 +898,8 @@ function EmulationTerminal({ projectId, session, onClose }: EmulationTerminalPro
     const MAX_RECONNECT_ATTEMPTS = 10
     const RECONNECT_BASE_DELAY = 1000
 
-    function connectWebSocket() {
-      const url = buildEmulationTerminalURL(projectId, session.id)
+    async function connectWebSocket() {
+      const url = await buildEmulationTerminalURL(projectId, session.id)
       const ws = new WebSocket(url)
       wsRef.current = ws
 
@@ -950,7 +950,7 @@ function EmulationTerminal({ projectId, session, onClose }: EmulationTerminalPro
       }
     }
 
-    connectWebSocket()
+    void connectWebSocket()
 
     const onData = term.onData((data: string) => {
       const ws = wsRef.current

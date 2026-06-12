@@ -83,6 +83,63 @@ def test_no_audience_configured_accepts_any(keypair):
     assert _verifier(keypair, audience="").verify(_token(keypair))["sub"] == "u1"
 
 
+def test_id_token_rejected(keypair):
+    # An ID token (token_use=id) must not be accepted for API access.
+    with pytest.raises(AuthError):
+        _verifier(keypair).verify(_token(keypair, aud=AUD, token_use="id"))
+
+
+def test_access_token_use_accepted(keypair):
+    assert _verifier(keypair).verify(
+        _token(keypair, client_id=AUD, token_use="access"))["sub"] == "u1"
+
+
+# --- WebSocket authorizer ---------------------------------------------------
+class _FakeWS:
+    def __init__(self, query=None, headers=None):
+        self.query_params = query or {}
+        self.headers = headers or {}
+        self.closed_code = None
+
+    async def close(self, code=1000):
+        self.closed_code = code
+
+
+def test_ws_disabled_allows(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(oidc, "get_verifier", lambda: None)
+    assert asyncio.run(oidc.authorize_websocket(_FakeWS())) == {}
+
+
+def test_ws_missing_token_closes_4401(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(oidc, "get_verifier",
+                        lambda: types.SimpleNamespace(verify=lambda t: {"sub": "u"}))
+    ws = _FakeWS()
+    assert asyncio.run(oidc.authorize_websocket(ws)) is None
+    assert ws.closed_code == 4401
+
+
+def test_ws_valid_query_token(monkeypatch):
+    import asyncio
+    stub = types.SimpleNamespace(verify=lambda t: {"sub": "u"} if t == "good"
+                                 else (_ for _ in ()).throw(AuthError("bad")))
+    monkeypatch.setattr(oidc, "get_verifier", lambda: stub)
+    ws = _FakeWS(query={"access_token": "good"})
+    assert asyncio.run(oidc.authorize_websocket(ws)) == {"sub": "u"}
+    assert ws.closed_code is None
+
+
+def test_ws_invalid_token_closes_4401(monkeypatch):
+    import asyncio
+    stub = types.SimpleNamespace(
+        verify=lambda t: (_ for _ in ()).throw(AuthError("bad")))
+    monkeypatch.setattr(oidc, "get_verifier", lambda: stub)
+    ws = _FakeWS(query={"access_token": "bad"})
+    assert asyncio.run(oidc.authorize_websocket(ws)) is None
+    assert ws.closed_code == 4401
+
+
 # --- get_verifier gating ----------------------------------------------------
 def test_get_verifier_none_when_disabled(monkeypatch):
     monkeypatch.setattr(oidc, "get_settings",

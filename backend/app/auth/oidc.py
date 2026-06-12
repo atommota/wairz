@@ -71,6 +71,12 @@ class OIDCVerifier:
             raise AuthError(f"invalid token: {exc}") from exc
         if not self._audience_ok(claims):
             raise AuthError("token audience mismatch")
+        # Reject ID tokens (and anything not an access token) for API access.
+        # `token_use` is Cognito-specific; absent for generic OIDC access tokens,
+        # so only enforce when present — keeps the verifier IdP-agnostic.
+        token_use = claims.get("token_use")
+        if token_use is not None and token_use != "access":
+            raise AuthError(f"expected an access token, got token_use={token_use!r}")
         return claims
 
     def _audience_ok(self, claims: dict) -> bool:
@@ -97,6 +103,33 @@ def get_verifier() -> OIDCVerifier | None:
     if not s.oidc_issuer:
         raise RuntimeError("auth_enabled is true but oidc_issuer is unset")
     return OIDCVerifier(s.oidc_issuer, s.oidc_audience, s.oidc_jwks_url)
+
+
+async def authorize_websocket(websocket) -> dict | None:
+    """Authorize a WebSocket connection (the http middleware can't see WS).
+
+    Returns the validated claims (an empty dict when auth is disabled), or None
+    after closing the socket if unauthorized — callers must `return` on None and
+    do no work. Browsers can't set headers on the WS handshake, so the token is
+    taken from the ``access_token`` query param (or an Authorization header for
+    non-browser clients). Call this immediately after ``websocket.accept()``.
+    """
+    verifier = get_verifier()
+    if verifier is None:  # auth disabled — allow (local default)
+        return {}
+    token = websocket.query_params.get("access_token")
+    if not token:
+        header = websocket.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header.split(" ", 1)[1].strip()
+    if not token:
+        await websocket.close(code=4401)  # 4401 = application "Unauthorized"
+        return None
+    try:
+        return await run_in_threadpool(verifier.verify, token)
+    except AuthError:
+        await websocket.close(code=4401)
+        return None
 
 
 async def auth_guard(request: Request, call_next):
