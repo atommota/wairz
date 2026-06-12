@@ -166,10 +166,197 @@ def _extract_ghidra_error(raw_output: str, script_name: str) -> str:
     return result
 
 
+# --- Shared helpers: cold-cache async routing + import/PLT-stub detection -----
+
+
+async def _ensure_analyzed_or_route(path: str, context: ToolContext) -> str | None:
+    """Cold-cache guard for the synchronous RE tools.
+
+    In cloud mode full Ghidra analysis runs on Batch and can take minutes; the
+    synchronous tools (list_functions/decompile/disassemble) would block and
+    504 at the gateway. When analysis isn't cached yet, kick off (or find an
+    in-flight) background job and return an ``analyzing - poll …`` handle — the
+    same async contract as start_binary_analysis — instead of blocking. Returns
+    None when analysis is already complete (caller proceeds normally).
+
+    No-op in local mode (returns None): there's no gateway timeout, so the
+    existing synchronous behavior is preserved.
+    """
+    if get_settings().compute_backend == "local":
+        return None
+    cache = get_analysis_cache()
+    sha256 = await cache.get_binary_sha256(path)
+    if await cache._is_analysis_complete(context.firmware_id, sha256, context.db):
+        return None
+    base = os.path.basename(path)
+    status_row = await cache.get_run_status(context.firmware_id, sha256, context.db)
+    if status_row and status_row.get("status") == "running":
+        job_ref = status_row.get("job_ref")
+        if describe_batch_job_state(job_ref) in ("queued", "starting", "running"):
+            elapsed = int(time.time() - status_row.get("started_at", 0))
+            return (
+                f"analyzing - {base} is being analyzed in the background "
+                f"({elapsed}s elapsed, job={job_ref}). Poll "
+                f"check_binary_analysis_status until 'complete', then retry."
+            )
+    try:
+        handle = get_dispatcher().dispatch_analysis(context.firmware_id, path, sha256)
+    except ConcurrencyLimitError as exc:
+        return f"rejected - {exc}"
+    await cache.mark_run_started(
+        context.firmware_id, path, sha256, handle.pid, context.db, job_ref=handle.ref,
+    )
+    await context.db.commit()
+    return (
+        f"analyzing - {base} isn't analyzed yet; kicked off Ghidra analysis "
+        f"(job {handle.ref}). Poll check_binary_analysis_status until "
+        f"'complete', then retry this call. Cold-cache analysis of a large "
+        f"binary takes minutes and runs server-side, independent of this session."
+    )
+
+
+def _needed_libs(elf_path: str) -> list[str]:
+    """DT_NEEDED (dynamic dependency) names of an ELF; [] if none/unreadable."""
+    try:
+        with open(elf_path, "rb") as f:
+            elf = ELFFile(f)
+            for seg in elf.iter_segments():
+                if seg.header.p_type == "PT_DYNAMIC":
+                    return [
+                        tag.needed for tag in seg.iter_tags()
+                        if tag.entry.d_tag == "DT_NEEDED"
+                    ]
+    except Exception:
+        pass
+    return []
+
+
+def _locate_libs(real_root: str, lib_names: list[str]) -> dict[str, str]:
+    """Map each lib basename → its real path. Checks the standard lib dirs first,
+    then (for any still missing) does ONE rootfs walk — firmware routinely puts
+    shared objects outside /lib,/usr/lib, which is the usual cause of a false
+    'not found in any linked library'."""
+    found: dict[str, str] = {}
+    missing: list[str] = []
+    for name in lib_names:
+        hit = None
+        for lib_dir in _STANDARD_LIB_PATHS:
+            cand = os.path.join(real_root, lib_dir.lstrip("/"), name)
+            if os.path.isfile(cand):
+                hit = cand
+                break
+        if hit:
+            found[name] = hit
+        else:
+            missing.append(name)
+    if missing:
+        wanted = set(missing)
+        for dirpath, _dirs, files in safe_walk(real_root):
+            for name in wanted.intersection(files):
+                found.setdefault(name, os.path.join(dirpath, name))
+            if wanted.issubset(found):
+                break
+    return found
+
+
+def _dynsym_func_state(lib_path: str, function_name: str) -> str:
+    """'found' if function_name is a defined function export in lib_path's
+    .dynsym; 'absent' if readable but not exported; 'unreadable' on error."""
+    try:
+        with open(lib_path, "rb") as f:
+            elf = ELFFile(f)
+            dynsym = elf.get_section_by_name(".dynsym")
+            if not (dynsym and isinstance(dynsym, SymbolTableSection)):
+                return "absent"
+            for sym in dynsym.iter_symbols():
+                if (sym.name == function_name
+                        and sym.entry.st_shndx != "SHN_UNDEF"
+                        and sym.entry.st_info.type in ("STT_FUNC", "STT_GNU_IFUNC")):
+                    return "found"
+            return "absent"
+    except Exception:
+        return "unreadable"
+
+
+def _resolve_export_library(real_root: str, needed_libs: list[str], function_name: str):
+    """Find the linked library exporting function_name (defined .dynsym FUNC).
+    Returns (found_real_path | None, report) where report buckets each lib into
+    with_symbol / found_no_symbol / missing_on_disk / unreadable so callers can
+    say *why* a lookup failed (lib absent vs symbol genuinely not exported)."""
+    located = _locate_libs(real_root, needed_libs)
+    found: str | None = None
+    report: dict[str, list[str]] = {
+        "with_symbol": [], "found_no_symbol": [], "missing_on_disk": [], "unreadable": [],
+    }
+    for name in needed_libs:
+        lib_path = located.get(name)
+        if not lib_path:
+            report["missing_on_disk"].append(name)
+            continue
+        state = _dynsym_func_state(lib_path, function_name)
+        if state == "found":
+            report["with_symbol"].append(name)
+            if found is None:
+                found = lib_path
+        elif state == "unreadable":
+            report["unreadable"].append(name)
+        else:
+            report["found_no_symbol"].append(name)
+    return found, report
+
+
+async def _stub_resolution_hint(
+    path: str, display_path: str, function_name: str, context: ToolContext,
+) -> str | None:
+    """If function_name is an import/PLT thunk (no local body), return a hint
+    routing to resolve_import (naming the implementing library when it can be
+    found cheaply). None for a real local function. Assumes analysis is complete
+    — call _ensure_analyzed_or_route first."""
+    cache = get_analysis_cache()
+    # Determining stub-ness must never break the underlying tool — if the
+    # function/import metadata can't be read, skip the hint and proceed.
+    try:
+        functions = await cache.get_functions(path, context.firmware_id, context.db)
+        is_thunk = any(
+            fn.get("name") == function_name and fn.get("is_thunk") for fn in functions
+        )
+        is_import = False
+        if not is_thunk:
+            imports = await cache.get_imports(path, context.firmware_id, context.db)
+            is_import = any(imp.get("name") == function_name for imp in imports)
+    except Exception:
+        logger.debug("stub-detection lookup failed for %s", function_name, exc_info=True)
+        return None
+    if not (is_thunk or is_import):
+        return None
+    kind = "a PLT/import thunk" if is_thunk else "an imported symbol"
+    base = os.path.basename(path)
+    where = "its implementation lives in a linked library. "
+    try:
+        found_lib, _report = _resolve_export_library(
+            context.real_root_for(display_path), _needed_libs(path), function_name,
+        )
+        if found_lib:
+            rel = "/" + os.path.relpath(found_lib, context.real_root_for(display_path))
+            where = f"its implementation is in {rel}. "
+    except Exception:
+        pass
+    return (
+        f"'{function_name}' is {kind} in {base} — it has no local body to "
+        f"decompile/disassemble. {where}Call resolve_import(binary_path="
+        f"'{display_path}', function_name='{function_name}') to decompile the "
+        f"real implementation (or run decompile_function directly on that library)."
+    )
+
+
 async def _handle_list_functions(input: dict, context: ToolContext) -> str:
     """List functions found in a binary, sorted by size (largest first)."""
     path = context.resolve_path(input["binary_path"])
     limit = min(input.get("limit", 100), 500)
+
+    gate = await _ensure_analyzed_or_route(path, context)
+    if gate is not None:
+        return gate
 
     cache = get_analysis_cache()
     functions = await cache.get_functions(path, context.firmware_id, context.db)
@@ -202,6 +389,15 @@ async def _handle_disassemble_function(input: dict, context: ToolContext) -> str
     path = context.resolve_path(input["binary_path"])
     function_name = input["function_name"]
     max_insn = input.get("num_instructions", 100)
+
+    gate = await _ensure_analyzed_or_route(path, context)
+    if gate is not None:
+        return gate
+    hint = await _stub_resolution_hint(
+        path, input["binary_path"], function_name, context,
+    )
+    if hint is not None:
+        return hint
 
     cache = get_analysis_cache()
     disasm = await cache.get_disassembly(
@@ -384,6 +580,15 @@ async def _handle_decompile_function(input: dict, context: ToolContext) -> str:
     path = context.resolve_path(input["binary_path"])
     function_name = input["function_name"]
 
+    gate = await _ensure_analyzed_or_route(path, context)
+    if gate is not None:
+        return gate
+    hint = await _stub_resolution_hint(
+        path, input["binary_path"], function_name, context,
+    )
+    if hint is not None:
+        return hint
+
     try:
         result = await decompile_function(
             binary_path=path,
@@ -484,56 +689,45 @@ async def _handle_resolve_import(input: dict, context: ToolContext) -> str:
     function_name = input["function_name"]
     real_root = context.real_root_for(input["binary_path"])
 
-    # Step 1: Parse DT_NEEDED from the target binary
-    try:
-        with open(path, "rb") as f:
-            elf = ELFFile(f)
-            needed_libs: list[str] = []
-            for seg in elf.iter_segments():
-                if seg.header.p_type == "PT_DYNAMIC":
-                    for tag in seg.iter_tags():
-                        if tag.entry.d_tag == "DT_NEEDED":
-                            needed_libs.append(tag.needed)
-                    break
-    except Exception as exc:
-        return f"Error reading binary: {exc}"
-
+    # Step 1: Parse DT_NEEDED (dynamic deps) from the target binary.
+    needed_libs = _needed_libs(path)
     if not needed_libs:
-        return f"Binary has no DT_NEEDED entries (statically linked?)."
+        return "Binary has no DT_NEEDED entries (statically linked?)."
 
-    # Step 2: Search each library's exports for the function
-    found_lib_path: str | None = None
-
-    for lib_name in needed_libs:
-        for lib_dir in _STANDARD_LIB_PATHS:
-            candidate = os.path.join(real_root, lib_dir.lstrip("/"), lib_name)
-            if not os.path.isfile(candidate):
-                continue
-            try:
-                with open(candidate, "rb") as f:
-                    lib_elf = ELFFile(f)
-                    dynsym = lib_elf.get_section_by_name(".dynsym")
-                    if dynsym and isinstance(dynsym, SymbolTableSection):
-                        for sym in dynsym.iter_symbols():
-                            if (sym.name == function_name
-                                    and sym.entry.st_shndx != "SHN_UNDEF"
-                                    and sym.entry.st_info.type in (
-                                        "STT_FUNC", "STT_GNU_IFUNC")):
-                                found_lib_path = candidate
-                                break
-                if found_lib_path:
-                    break
-            except Exception:
-                continue
-        if found_lib_path:
-            break
+    # Step 2: Locate each linked library across the whole rootfs (not just the
+    # standard dirs) and scan its .dynsym for a defined export — no pre-analysis
+    # needed. The report lets us say *why* a lookup failed.
+    found_lib_path, report = _resolve_export_library(
+        real_root, needed_libs, function_name,
+    )
 
     if not found_lib_path:
-        return (
-            f"Function '{function_name}' not found in any linked library.\n"
-            f"Searched libraries: {', '.join(needed_libs)}\n"
-            f"Search paths: {', '.join(_STANDARD_LIB_PATHS)}"
+        lines = [
+            f"'{function_name}' is not an exported function in any linked "
+            f"library that could be located on disk."
+        ]
+        if report["found_no_symbol"]:
+            lines.append(
+                f"  Checked (.dynsym scanned), symbol not exported: "
+                f"{', '.join(report['found_no_symbol'])}"
+            )
+        if report["missing_on_disk"]:
+            lines.append(
+                f"  Declared (DT_NEEDED) but the .so was NOT found on disk, so "
+                f"NOT actually checked: {', '.join(report['missing_on_disk'])}. "
+                f"The symbol may well be exported by one of these — find the "
+                f".so in the firmware (it may live outside /lib,/usr/lib) and "
+                f"run decompile_function on it directly."
+            )
+        if report["unreadable"]:
+            lines.append(
+                f"  Found but unreadable as ELF: {', '.join(report['unreadable'])}"
+            )
+        lines.append(
+            "  Note: only dynamic exports (.dynsym) are resolvable here — a "
+            "static/internal symbol won't appear even if present."
         )
+        return "\n".join(lines)
 
     # Compute firmware-relative path for display
     rel_lib_path = "/" + os.path.relpath(found_lib_path, real_root)
