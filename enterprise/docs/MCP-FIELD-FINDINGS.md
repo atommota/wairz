@@ -41,10 +41,74 @@ Details + proposed fixes: `enterprise/PLAN.md` Phase 6.
 
 ---
 
-## Fix status (updated 2026-06-12)
+## Second cloud agent session (2026-06-14) — re-test of the same pingTest workflow
+
+Re-ran the exact `/sbin/httpd` `pingTest` command-injection workflow against the
+live cloud stack (project `sdcard`, ARM httpd linking `libsml.so`) to confirm the
+2026-06-12 fixes and look for new issues. **All previously-fixed field bugs
+behaved correctly** (PLT-stub hint instant on cold cache → named `libsml.so`;
+`resolve_import` resolved + decompiled the real impl, surfacing the
+`system("ping -c 1 %s")` injection; `disassemble` on a stub returns the hint not
+empty; by-address accepted; `hexdump_data` works; `search_strings` `query` alias
+works). Two new findings:
+
+### NEW (fixed this session) — one-shot decompile worker re-dispatched to Batch
+`decompile_function` by-address on a cold cache (`httpd` `handle_request`
+@0x000263d0) went `queued → starting → FAILED`:
+
+```
+AccessDeniedException: role wairz-test-batch-job not authorized to perform
+batch:SubmitJob on resource arn:aws:batch:...:job-definition/   (empty name)
+```
+
+Root cause: `app.workers.run_function_decompile` runs ON the Batch Ghidra box but
+called the dispatching `run_ghidra_subprocess`, which in cloud mode re-routes to
+the reuse worker via `batch:SubmitJob` — so the worker tried to submit *another*
+Batch job (recursive dispatch) and its job role rightly can't. The sibling
+analysis worker already runs Ghidra in-process, which is why
+`start_binary_analysis` SUCCEEDED but `start_function_decompile` failed.
+
+**Fixed** (`7fdc84b`) — worker now calls `_run_ghidra_local` (same in-process
+executor the reuse + analysis workers use). Redeployed (ghidra image
+`7fdc84b3170b`, job-def rev 23); re-ran the failing call live: job **SUCCEEDED**,
+worker log shows `Reusing project … DecompileFunction.java (-process, no
+re-analysis)` (no SubmitJob), and `decompile_function 0x000263d0` now returns the
+full `handle_request` pseudo-C from cache. Regression test
+`test_function_decompile_worker.py` pins the in-process executor.
+
+### Cloud #1 is worse than "cosmetic" — it breaks MCP reconnection across a backend roll
+Confirmed mechanism with a hard repro: an unknown/stale `Mcp-Session-Id` returns
+**`HTTP 200` + `content-type: text/html`** (the SPA `index.html`), because the
+distribution-wide `custom_error_response` (403 **and** 404 → `/index.html`)
+rewrites the ALB/MCP origin's `404 session-not-found`. The Streamable-HTTP client
+can't distinguish "session expired → re-initialize" from a hard error, so after
+any backend task replacement (every redeploy, every ECS roll) a connected client
+wedges on `Unexpected content type: text/html` until fully restarted. This was
+the actual cause of the connection failures in both sessions.
+**Recommended fix:** decouple SPA deep-link routing from the global error rewrite
+so `/mcp*` (and `/api/*`) 404s pass through untouched. Cleanest is a CloudFront
+viewer-request Function that rewrites only extension-less, non-`/mcp`, non-`/api`
+paths to `/index.html`, then drop the distribution-wide `custom_error_response`.
+Minimal-risk alternative: drop only the `404→index.html` rewrite and keep
+`403→index.html` (S3+OAC returns 403 for missing keys, so SPA routing survives;
+MCP returns 404 for unknown sessions, which would then reach the client). Still
+open (Phase 6 #1) — needs a conscious SPA-routing change, not done unilaterally.
+
+### Minor (cosmetic) — background-decompiled output carries Ghidra log prefixes
+Functions decompiled via the one-shot/background worker come back with per-line
+`INFO  DecompileFunction.java> …` prefixes interleaved in the pseudo-C, whereas
+the synchronous/reuse-worker path is clean. Readable but noisier; the background
+path should strip the headless log prefix the same way the sync path does.
+
+---
+
+## Fix status (updated 2026-06-14)
 
 | Item | Status |
 |---|---|
+| Cloud (2026-06-14) one-shot decompile worker re-dispatched to Batch (SubmitJob denial) | ✅ **fixed** (`7fdc84b`) — worker runs Ghidra in-process via `_run_ghidra_local`; live-validated job SUCCEEDED + cached result |
+| Cloud #1 CloudFront HTML masks 404 → breaks MCP reconnection after backend roll | ⏳ open (upgraded HIGH) — hard repro captured; fix = decouple SPA routing from global error rewrite |
+| Cloud background-decompile output carries Ghidra `INFO …>` log prefixes | ⏳ open (cosmetic) |
 | Core #1 PLT/import-stub blindness | ✅ **fixed** (`3f44b89`) — detect thunk/import → route to resolve_import; live-validated (0.9s vs 600s hang) |
 | Core #2 resolve_import false negative | ✅ **fixed** (`3f44b89`) — whole-rootfs lib search + precise "why" diagnostics; live-validated (found pingTest in libsml.so) |
 | Core #3 no decompile/disassemble by address | ✅ **fixed** (`a110bed`) — decompile_function accepts `0x…` (now incl. getFunctionContaining), documented |
