@@ -54,6 +54,41 @@ locals {
   alb_origin_id = "backend-alb"
 }
 
+# SPA client-side routing, scoped to the S3 behavior only.
+#
+# This REPLACES a distribution-wide `custom_error_response` (403/404 →
+# /index.html). That rewrite was global and also caught the ALB/MCP origin: an
+# unknown/stale Mcp-Session-Id returns 404 from the backend, which CloudFront
+# masked as `200 text/html` (index.html). The Streamable-HTTP client then can't
+# tell "session expired → re-initialize" from a hard error and wedges on
+# "Unexpected content type: text/html" after every backend roll. See
+# enterprise/docs/MCP-FIELD-FINDINGS.md (Cloud #1).
+#
+# Instead, rewrite deep links to /index.html *before* they hit S3, attached only
+# to the default (S3) behavior. /api/* and /mcp* have their own behaviors and
+# never see this function, so their 404s pass through honestly. A genuinely
+# missing asset (path with an extension) now returns a real 404 instead of
+# index.html. Caveat: SPA routes containing a "." in the last path segment are
+# treated as assets — keep client routes extension-less.
+resource "aws_cloudfront_function" "spa_router" {
+  name    = "${var.name}-spa-router"
+  runtime = "cloudfront-js-2.0"
+  comment = "SPA deep-link routing: rewrite extension-less paths to /index.html"
+  publish = true
+  code    = <<-JS
+    function handler(event) {
+      var request = event.request;
+      var uri = request.uri;
+      var last = uri.substring(uri.lastIndexOf('/') + 1);
+      // No file extension in the final segment → SPA route → serve the shell.
+      if (last.indexOf('.') === -1) {
+        request.uri = '/index.html';
+      }
+      return request;
+    }
+  JS
+}
+
 resource "aws_cloudfront_distribution" "this" {
   enabled             = true
   default_root_object = "index.html"
@@ -92,6 +127,11 @@ resource "aws_cloudfront_distribution" "this" {
     cache_policy_id            = data.aws_cloudfront_cache_policy.optimized.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security.id
     compress                   = true
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.spa_router.arn
+    }
   }
 
   # API + websockets → ALB, uncached, forward everything.
@@ -122,19 +162,10 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-  # SPA client-side routing: serve index.html for unknown paths.
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 10
-  }
-  custom_error_response {
-    error_code            = 404
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 10
-  }
+  # SPA client-side routing is handled by aws_cloudfront_function.spa_router on
+  # the default (S3) behavior — NOT a distribution-wide custom_error_response,
+  # which would also mask /mcp* and /api/* 404s as 200/index.html and break MCP
+  # session recovery. See the function's comment above.
 
   restrictions {
     geo_restriction {

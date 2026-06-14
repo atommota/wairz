@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -202,6 +203,24 @@ def _parse_analysis_output(raw_output: str) -> dict | None:
         return None
 
 
+# Ghidra's headless logger wraps each script println() as
+#   "INFO  DecompileFunction.java> <text> (GhidraScript)"
+# (only the first physical line of a multi-line println is wrapped). Strip the
+# leading level+script prefix and the trailing " (GhidraScript)" marker so the
+# decompiled C comes back clean, the same way _parse_analysis_output pulls the
+# bare JSON out from between its markers.
+_GHIDRA_LOG_PREFIX = re.compile(r"^(?:INFO|WARN|WARNING|ERROR|DEBUG)\s+\S+\.java>\s?")
+_GHIDRA_LOG_SUFFIX = re.compile(r"\s*\(GhidraScript\)\s*$")
+
+
+def _strip_ghidra_log_wrapper(content: str) -> str:
+    cleaned = [
+        _GHIDRA_LOG_SUFFIX.sub("", _GHIDRA_LOG_PREFIX.sub("", line))
+        for line in content.splitlines()
+    ]
+    return "\n".join(cleaned).strip()
+
+
 def _parse_decompile_output(raw_output: str) -> str | None:
     """Extract decompiled code from DecompileFunction.java output between markers."""
     start = raw_output.find(_DECOMPILE_START)
@@ -211,6 +230,7 @@ def _parse_decompile_output(raw_output: str) -> str | None:
         return None
 
     content = raw_output[start + len(_DECOMPILE_START):end].strip()
+    content = _strip_ghidra_log_wrapper(content)
     return content if content else None
 
 
