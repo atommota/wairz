@@ -117,10 +117,16 @@ if [ -S "$CMD_SOCK" ]; then
     run_on_sock "$CMD_SOCK" 0
     if [ "$FOUND" -eq 0 ] && [ -S "$CONSOLE_SOCK" ]; then
         # Command channel socket exists but no shell answered (kernel lacked the
-        # device) — fall back to the console (with reset).
-        run_on_sock "$CONSOLE_SOCK" 1
+        # device). Fall back to the console WITHOUT the Ctrl-C reset: a stray ^C
+        # on this shared socket interrupts whatever an interactive analyst (the
+        # web terminal) is running. We requested the dedicated channel precisely
+        # to avoid touching the console, so don't make the fallback destructive.
+        run_on_sock "$CONSOLE_SOCK" 0
     fi
 elif [ -S "$CONSOLE_SOCK" ]; then
+    # Console-only board (no dedicated channel was wired). Here the reset is the
+    # only way to recover a fresh prompt from a possibly-stuck foreground
+    # process, so keep it — there is no interactive terminal to protect.
     run_on_sock "$CONSOLE_SOCK" 1
 else
     echo "No serial socket found ($CMD_SOCK or $CONSOLE_SOCK)" >&2

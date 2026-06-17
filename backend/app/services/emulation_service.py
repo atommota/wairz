@@ -1041,18 +1041,42 @@ echo "[wairz] Ensured shell on console ${ACTIVE_TTY:-/dev/console}"
             # in the background, auto-detecting across the candidates, then serve
             # a persistent echo-disabled shell. serial-exec.sh prefers this
             # noise-free channel and falls back to the console if it never comes
-            # up. A readiness banner is written to the device so the host side
-            # can confirm the data path.
+            # up.
+            #
+            # Two subtleties this loop handles (see bug report
+            # wairz_bug_report_emulation_cmd_channel_hvc0.md):
+            #   1. Probe candidates by actually OPENING them, not just [ -e ].
+            #      A virtio-console port also registers a /dev/vportNp0 data
+            #      node (major 250) that returns ENXIO on open — selecting it by
+            #      mere existence wedges the channel. The fd-open probe rejects
+            #      such non-openable nodes.
+            #   2. Create the node when /dev is NOT devtmpfs. Firmware images
+            #      that ship a populated static /dev (so /dev/null already
+            #      exists) never get devtmpfs mounted, so the kernel registers
+            #      the virtio-console device but no /dev/hvc0 node is ever
+            #      created. Once the hvc major appears in /proc/devices (driver
+            #      bound), mknod /dev/hvc0 c <maj> 0 ourselves and confirm it
+            #      opens (ENXIO until the port is wired up).
             cmd_channel_block = (
                 "\n# --- Dedicated command channel (feedback #6) ---\n"
                 f'WZ_CMD_DEV="{cmd_channel_dev}"\n'
                 '( _wzdev=""\n'
                 '  _n=0\n'
                 '  while [ $_n -lt 60 ]; do\n'
-                '      for _c in "$WZ_CMD_DEV" /dev/hvc0 /dev/vport0p0 /dev/vport1p0 /dev/vport2p0; do\n'
-                '          if [ -n "$_c" ] && [ -e "$_c" ]; then _wzdev="$_c"; break; fi\n'
+                '      # 1) Use an existing node only if it actually opens.\n'
+                '      for _c in "$WZ_CMD_DEV" /dev/hvc0 /dev/ttyAMA1 /dev/ttyS1; do\n'
+                '          [ -n "$_c" ] && [ -e "$_c" ] || continue\n'
+                '          if (exec 9<>"$_c") 2>/dev/null; then _wzdev="$_c"; break; fi\n'
                 '      done\n'
                 '      [ -n "$_wzdev" ] && break\n'
+                '      # 2) Static (non-devtmpfs) /dev: create /dev/hvc0 from the\n'
+                '      #    registered hvc major, then confirm it opens.\n'
+                '      _maj=$(awk \'$2=="hvc"{print $1; exit}\' /proc/devices 2>/dev/null)\n'
+                '      if [ -n "$_maj" ]; then\n'
+                '          mknod /dev/hvc0 c "$_maj" 0 2>/dev/null || true\n'
+                '          if (exec 9<>/dev/hvc0) 2>/dev/null; then _wzdev=/dev/hvc0; break; fi\n'
+                '          rm -f /dev/hvc0 2>/dev/null || true\n'
+                '      fi\n'
                 '      _n=$((_n+1)); sleep 0.5\n'
                 '  done\n'
                 '  if [ -n "$_wzdev" ]; then\n'
