@@ -282,8 +282,25 @@ class FileService:
             sub = "/" + parts[1] if len(parts) > 1 else "/"
             return validate_path(base_path, sub)
 
-        # Everything else → extraction_dir/...
-        return validate_path(self.extraction_dir, path)
+        # Everything else → extraction_dir/..., but be forgiving about the
+        # rootfs prefix. Analysis tools tend to be handed virtual paths
+        # (/rootfs/sbin/foo) while fuzzing/other tools are handed bare
+        # firmware-relative paths (/sbin/foo). In virtual (multi-partition)
+        # mode a bare path resolves under the extraction dir, not the rootfs,
+        # so the unprefixed form silently misses. If the extraction-dir
+        # candidate doesn't exist but the same path under the rootfs does,
+        # resolve it there so both spellings work (feedback #8). Paths that
+        # don't exist anywhere (e.g. a file about to be written) keep the
+        # extraction-dir base, preserving prior behaviour.
+        ext_candidate = validate_path(self.extraction_dir, path)
+        if not os.path.exists(ext_candidate):
+            try:
+                rootfs_candidate = validate_path(self.extracted_root, path)
+            except Exception:
+                rootfs_candidate = None
+            if rootfs_candidate and os.path.exists(rootfs_candidate):
+                return rootfs_candidate
+        return ext_candidate
 
     # Back-compat alias used by some callers
     def _validate(self, path: str) -> str:

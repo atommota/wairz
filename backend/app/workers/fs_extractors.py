@@ -20,7 +20,7 @@ from typing import Awaitable, Callable, Literal
 
 from .unpack import _KERNEL_NAME_PATTERNS
 
-FsType = Literal["squashfs", "ubi", "ubifs", "jffs2", "cramfs", "ext", "cpio"]
+FsType = Literal["squashfs", "ubi", "ubifs", "jffs2", "cramfs", "ext", "cpio", "yaffs"]
 
 
 # Magic bytes at offset 0. Ext is the exception — see _detect_fs_type.
@@ -52,6 +52,13 @@ def _detect_fs_type(path: str) -> FsType | None:
         return None
     if size < _MIN_FS_SIZE or size > _MAX_FS_SIZE:
         return None
+
+    # YAFFS/YAFFS2 has no offset-0 magic — it's a raw NAND dump that begins
+    # with the first object's data+spare. binwalk's signature scan names the
+    # carved partition *.yaffs / *.yaffs2, so detect it by extension and let
+    # yaffshiv validate the geometry. (A content sniff isn't reliable here.)
+    if path.lower().endswith((".yaffs", ".yaffs2")):
+        return "yaffs"
 
     try:
         with open(path, "rb") as f:
@@ -238,6 +245,39 @@ async def _extract_cpio(src: str, out_dir: str, timeout: int) -> tuple[bool, str
     return False, f"cpio rc={rc}"
 
 
+async def _extract_yaffs(src: str, out_dir: str, timeout: int) -> tuple[bool, str]:
+    """Extract YAFFS/YAFFS2 with yaffshiv.
+
+    YAFFS stores files as data chunks each carrying a spare/OOB tag (object id,
+    chunk id, byte count, ECC), and the page+spare geometry varies wildly
+    (2048+64, 2048+128, 512+16, inband tags, big/little-endian, ECC on/off).
+    A plain magic-carve corrupts any multi-chunk file because it can't strip
+    the interleaved spare bytes — only a tag-aware parser reassembles files.
+
+    yaffshiv auto-detects the geometry; if that yields nothing we fall back to
+    brute-forcing every page/spare/ECC/endianness combination.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    rc, _log = await _run(
+        ["yaffshiv", "-a", "-f", src, "-d", out_dir], timeout=timeout
+    )
+    if rc == 0 and os.listdir(out_dir):
+        return True, "yaffshiv ok (auto-detected geometry)"
+
+    # Auto-detect failed — reset the output dir and brute-force the geometry.
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+    rc2, _log2 = await _run(
+        ["yaffshiv", "-b", "-f", src, "-d", out_dir], timeout=timeout
+    )
+    if rc2 == 0 and os.listdir(out_dir):
+        return True, "yaffshiv ok (brute-forced geometry)"
+    return (
+        False,
+        f"yaffshiv auto rc={rc}, brute-force rc={rc2}; geometry not recognized",
+    )
+
+
 _Extractor = Callable[[str, str, int], Awaitable[tuple[bool, str]]]
 _EXTRACTORS: dict[FsType, _Extractor] = {
     "squashfs": _extract_squashfs,
@@ -247,6 +287,7 @@ _EXTRACTORS: dict[FsType, _Extractor] = {
     "cramfs":   _extract_cramfs,
     "ext":      _extract_ext,
     "cpio":     _extract_cpio,
+    "yaffs":    _extract_yaffs,
 }
 
 
@@ -288,17 +329,6 @@ def _scan_candidates(
     return hits
 
 
-def _count_yaffs_candidates(extraction_dir: str, extraction_root_real: str) -> int:
-    count = 0
-    for root, _dirs, files in os.walk(extraction_dir):
-        for name in files:
-            if name.lower().endswith((".yaffs", ".yaffs2")):
-                path = os.path.join(root, name)
-                if not _is_excluded(path, extraction_root_real):
-                    count += 1
-    return count
-
-
 def _dir_bytes(path: str) -> int:
     total = 0
     for root, _dirs, files in os.walk(path):
@@ -321,10 +351,11 @@ async def recursive_extract(
     """Extract filesystem images under ``extraction_dir`` until fixed-point.
 
     Detects SquashFS/UBI/UBIFS/JFFS2/CramFS/ext2-4/cpio by magic bytes at
-    offset 0 (ext at 0x438). Dispatches to unsquashfs (with sasquatch
-    fallback), ubireader_extract_images/_files, jefferson, cramfsck, ``7z x``,
-    and ``cpio -idmv``. Each extraction writes to ``<file>.extracted/`` as a
-    sibling directory.
+    offset 0 (ext at 0x438), and YAFFS/YAFFS2 by *.yaffs/*.yaffs2 extension
+    (no offset-0 magic). Dispatches to unsquashfs (with sasquatch fallback),
+    ubireader_extract_images/_files, jefferson, cramfsck, ``7z x``,
+    ``cpio -idmv``, and yaffshiv (auto-detect → brute-force geometry). Each
+    extraction writes to ``<file>.extracted/`` as a sibling directory.
 
     SHA256 deduplication prevents re-extracting identical blobs emitted
     under multiple paths. Loops until no new images are found or max_depth
@@ -393,13 +424,6 @@ async def recursive_extract(
             break
     else:
         lines.append(f"[fs_extractors] reached max_depth={max_depth}; stopping")
-
-    yaffs_count = _count_yaffs_candidates(extraction_dir, extraction_root_real)
-    if yaffs_count:
-        lines.append(
-            f"[fs_extractors] {yaffs_count} YAFFS image(s) detected; "
-            f"manual extraction with yaffshiv (needs page+OOB size hints) required"
-        )
 
     lines.append("[fs_extractors] done")
     return "\n".join(lines) + "\n"

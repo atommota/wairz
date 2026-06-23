@@ -1,3 +1,17 @@
+# Multi-stage build with two runnable targets:
+#
+#   base    — shared: extraction toolchain, Python deps, app code. Not run directly.
+#   backend — SLIM serving image (no Ghidra/JDK). Used by the enterprise Fargate
+#             backend, which dispatches Ghidra to AWS Batch and never runs it
+#             in-process. ~1 GB smaller → faster ECS cold-start image pulls.
+#   ghidra  — FULL image: base + OpenJDK 21 + Ghidra. The DEFAULT (last) stage,
+#             so `docker build`/docker-compose (local mode runs Ghidra in the
+#             backend container) and the enterprise Batch worker get it unchanged.
+#
+# Enterprise builds target each explicitly (enterprise/scripts/build-and-push-
+# backend.sh): `--target backend` → backend ECR repo, `--target ghidra` → ghidra
+# ECR repo. A bare build (compose) falls through to the final `ghidra` stage.
+
 FROM python:3.12-slim AS base
 
 # Install system dependencies for firmware analysis
@@ -51,6 +65,67 @@ RUN git clone https://github.com/devttys0/sasquatch.git /tmp/sasquatch \
     rm -rf /tmp/sasquatch; \
     which sasquatch || echo "WARN: sasquatch build failed — non-standard SquashFS won't extract"
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Create non-root user and add to docker group for emulation container management.
+# The docker socket GID from the host is passed via build arg (default 999).
+ARG DOCKER_GID=999
+RUN useradd -m -s /bin/bash wairz \
+    && if getent group ${DOCKER_GID} >/dev/null; then \
+         existing_group=$(getent group ${DOCKER_GID} | cut -d: -f1); \
+         usermod -aG "${existing_group}" wairz; \
+       else \
+         groupadd -g ${DOCKER_GID} docker && usermod -aG docker wairz; \
+       fi
+
+# Set up working directory
+WORKDIR /app
+
+# Copy dependency files first for caching
+COPY pyproject.toml uv.lock* ./
+
+# Install dependencies
+RUN uv sync --no-dev --no-editable 2>/dev/null || uv sync --no-editable
+
+# Copy application code
+COPY . .
+
+# Bake in default emulation kernels so they're available out of the box.
+# The docker-compose bind mount (./emulation/kernels:/opt/kernels) overlays
+# on top at runtime, allowing users to add custom kernels.
+COPY --from=kernels . /opt/kernels/
+
+# Bake in the Ghidra headless scripts (AnalyzeBinary.java, DecompileFunction.java,
+# ...). Locally these come via the compose bind mount (./ghidra/scripts:
+# /opt/ghidra_scripts), but the cloud (Batch/Fargate) deployment has no bind
+# mount — without baking them in, every analyzeHeadless -postScript fails.
+COPY --from=ghidra_scripts . /opt/ghidra_scripts/
+
+# Create data and Ghidra project directories.
+# /data/ghidra_projects must exist (and be wairz-owned) in the image so that
+# when the empty named volume is first mounted there, Docker seeds the volume
+# with wairz ownership instead of defaulting the mountpoint to root:root —
+# otherwise the backend (uid 1000) can't create the versioned project subdir.
+RUN mkdir -p /data/firmware /data/ghidra_projects /tmp/ghidra_projects \
+    && chown -R wairz:wairz /data /app /tmp/ghidra_projects /opt/kernels /opt/ghidra_scripts
+
+
+# --- backend: slim serving image (no Ghidra/JDK), enterprise Fargate ---------
+FROM base AS backend
+
+USER wairz
+EXPOSE 8000
+CMD ["sh", "-c", "uv run alembic upgrade head && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+
+
+# --- ghidra: full image (base + OpenJDK 21 + Ghidra). DEFAULT stage. ---------
+# Local docker-compose builds this (runs Ghidra in-process); enterprise pushes
+# it to the Batch/Ghidra ECR repo.
+FROM base AS ghidra
+
+USER root
+
 # Install OpenJDK 21 for Ghidra (JDK 17 not available in Trixie)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jdk-headless \
@@ -92,44 +167,7 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
         echo "x86_64 detected — using pre-built Ghidra natives"; \
     fi
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
-# Create non-root user and add to docker group for emulation container management.
-# The docker socket GID from the host is passed via build arg (default 999).
-ARG DOCKER_GID=999
-RUN useradd -m -s /bin/bash wairz \
-    && if getent group ${DOCKER_GID} >/dev/null; then \
-         existing_group=$(getent group ${DOCKER_GID} | cut -d: -f1); \
-         usermod -aG "${existing_group}" wairz; \
-       else \
-         groupadd -g ${DOCKER_GID} docker && usermod -aG docker wairz; \
-       fi
-
-# Set up working directory
-WORKDIR /app
-
-# Copy dependency files first for caching
-COPY pyproject.toml uv.lock* ./
-
-# Install dependencies
-RUN uv sync --no-dev --no-editable 2>/dev/null || uv sync --no-editable
-
-# Copy application code
-COPY . .
-
-# Bake in default emulation kernels so they're available out of the box.
-# The docker-compose bind mount (./emulation/kernels:/opt/kernels) overlays
-# on top at runtime, allowing users to add custom kernels.
-COPY --from=kernels . /opt/kernels/
-
-# Create data and Ghidra project directories.
-# /data/ghidra_projects must exist (and be wairz-owned) in the image so that
-# when the empty named volume is first mounted there, Docker seeds the volume
-# with wairz ownership instead of defaulting the mountpoint to root:root —
-# otherwise the backend (uid 1000) can't create the versioned project subdir.
-RUN mkdir -p /data/firmware /data/ghidra_projects /tmp/ghidra_projects \
-    && chown -R wairz:wairz /data /app /tmp/ghidra_projects /opt/ghidra /opt/kernels
+RUN chown -R wairz:wairz /opt/ghidra
 
 USER wairz
 

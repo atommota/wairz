@@ -80,6 +80,9 @@ wairz/
 │   └── scripts/                 # start-user-mode.sh, start-system-mode.sh, serial-exec.sh
 ├── fuzzing/
 │   └── Dockerfile               # AFL++ with QEMU mode
+├── harness-build/
+│   ├── Dockerfile               # Bootlin old-glibc cross toolchains (armhf/armel/aarch64/mips/mipsel)
+│   └── build-harness.sh         # Cross-compile a harness linked against a firmware .so
 └── scripts/
     └── wairz-uart-bridge.py     # Host-side serial bridge (standalone, pyserial only)
 ```
@@ -200,7 +203,7 @@ Tools that take a `binary_path` / `path` argument and call `context.resolve_path
 | Security | `tools/security.py` | `check_known_cves`, `analyze_config_security`, `check_setuid_binaries`, `analyze_init_scripts`, `check_filesystem_permissions`, `analyze_certificate` |
 | SBOM | `tools/sbom.py` | `generate_sbom`, `get_sbom_components`, `check_component_cves`, `run_vulnerability_scan` |
 | Emulation | `tools/emulation.py` | `start_emulation`, `run_command_in_emulation`, `stop_emulation`, `check_emulation_status`, `get_emulation_logs`, `enumerate_emulation_services`, `diagnose_emulation_environment`, `troubleshoot_emulation`, `get_crash_dump`, `run_gdb_command`, `save_emulation_preset`, `list_emulation_presets`, `start_emulation_from_preset` |
-| Fuzzing | `tools/fuzzing.py` | `analyze_fuzzing_target`, `generate_fuzzing_dictionary`, `generate_seed_corpus`, `generate_fuzzing_harness`, `start_fuzzing_campaign`, `check_fuzzing_status`, `stop_fuzzing_campaign`, `triage_fuzzing_crash`, `diagnose_fuzzing_campaign` |
+| Fuzzing | `tools/fuzzing.py` | `analyze_fuzzing_target`, `generate_fuzzing_dictionary`, `generate_seed_corpus`, `generate_fuzzing_harness`, `build_fuzz_harness`, `patch_function_return`, `start_fuzzing_campaign`, `check_fuzzing_status`, `stop_fuzzing_campaign`, `triage_fuzzing_crash`, `diagnose_fuzzing_campaign` |
 | Comparison | `tools/comparison.py` | `list_firmware_versions`, `diff_firmware`, `diff_binary`, `diff_decompilation` |
 | UART | `tools/uart.py` | `uart_connect`, `uart_send_command`, `uart_read`, `uart_send_break`, `uart_send_raw`, `uart_disconnect`, `uart_status`, `uart_get_transcript` |
 | Reporting | `tools/reporting.py` | `add_finding`, `list_findings`, `get_finding`, `update_finding`, `read_project_instructions`, `list_project_documents`, `read_project_document` |
@@ -257,6 +260,37 @@ See `.env.example` for defaults. Key variables:
 | `FUZZING_IMAGE` / `FUZZING_TIMEOUT_MINUTES` | Docker image and timeout for AFL++ containers |
 | `UART_BRIDGE_HOST` / `UART_BRIDGE_PORT` | Host-side UART bridge connection |
 | `NVD_API_KEY` | Optional, for higher NVD rate limits during CVE scanning |
+
+---
+
+## Enterprise / Cloud Deployment (`enterprise/`)
+
+The `enterprise/` directory is a self-contained AWS deployment target (Terraform)
+that runs Wairz elastically: SPA on S3/CloudFront, FastAPI on Fargate, Aurora
+Serverless v2, ElastiCache, EFS-shared firmware storage, and Ghidra
+decompilation bursting onto **scale-to-zero AWS Batch** workers. It also adds an
+optional custom domain + Cognito/OIDC auth (SSO-ready) and a remote
+Streamable-HTTP MCP transport.
+
+**The non-negotiable contract when touching app code: every cloud behavior is
+config-gated and defaults to the local behavior.** The single-host
+`docker compose` workflow must keep working unchanged with the default settings,
+and the existing test suite must stay green with defaults. Concretely:
+
+- Cloud features are toggled by settings (e.g. `auth_enabled`, Batch dispatch,
+  Redis-backed analysis lock, `allowed_hosts`/`allowed_origins`,
+  `mcp_http_enabled`) whose **defaults reproduce the original local behavior**.
+- Firmware storage stays a POSIX path (EFS) — do not migrate `STORAGE_ROOT` to an
+  S3-only abstraction.
+- Keep the existing async job protocol (`analysis_cache` / `ghidra_analysis_run` +
+  poll tools); the enterprise change only moves *where* Ghidra runs and *what
+  backs the cross-process lock*.
+- `docker.sock` features (fuzzing, emulation, carving) are **out of scope for the
+  cloud MVP** but must gate off gracefully, not be hard-removed.
+
+Start at [`enterprise/PLAN.md`](enterprise/PLAN.md) — its "Codebase Ground Truth"
+and "Guardrails for agents" sections are required reading before changing
+anything in this subtree. Operations/cost detail is in `enterprise/docs/`.
 
 ---
 

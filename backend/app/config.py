@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -20,6 +21,14 @@ class Settings(BaseSettings):
     max_tool_iterations: int = 25
     ghidra_path: str = "/opt/ghidra"
     ghidra_scripts_path: str = "/opt/ghidra_scripts"
+    # Persistent Ghidra project store. A binary is imported + auto-analyzed once
+    # into <ghidra_project_root>/<ghidra_version>/<sha256>/ and kept; subsequent
+    # scripts reuse it via -process (no re-analysis), so analysis done once is
+    # shared across sessions/agents/users. Back this with a durable volume.
+    ghidra_project_root: str = "/data/ghidra_projects"
+    # Project-store GC: evict least-recently-used projects once the store
+    # exceeds this many projects (0 disables GC). Keyed by access time.
+    ghidra_project_cache_max: int = 200
     ghidra_timeout: int = 300
     ghidra_background_analysis_timeout: int = 3600
     ghidra_background_decompile_timeout: int = 1800
@@ -42,10 +51,63 @@ class Settings(BaseSettings):
     carving_cpu_limit: float = 1.0
     carving_default_timeout: int = 60
     carving_max_timeout: int = 600
+    # Harness-build sandbox (cross-compiles fuzzing harnesses vs firmware .so).
+    harness_build_image: str = "wairz-harness-build"
+    harness_build_memory_limit_mb: int = 2048
+    harness_build_cpu_limit: float = 2.0
+    harness_build_timeout: int = 180
     uart_bridge_host: str = "host.docker.internal"
     uart_bridge_port: int = 9999
     uart_command_timeout: int = 30
     log_level: str = "INFO"
+
+    # Host/origin guard (app/main.py). Comma-separated extra entries. Empty =
+    # the built-in localhost set (the local desktop deploy, unchanged). "*"
+    # disables the corresponding check — appropriate when the API sits behind an
+    # authenticating proxy (ALB/CloudFront + Cognito) where Host varies.
+    allowed_hosts: str = ""
+    allowed_origins: str = ""
+
+    # --- Compute backend (enterprise cloud deploy) ---------------------------
+    # Where heavy Ghidra jobs run. "local" (default) spawns detached worker
+    # subprocesses on the backend host — the standard docker-compose behavior,
+    # unchanged. "aws_batch" submits the same worker as an AWS Batch job
+    # (enterprise/PLAN.md, Phase 2). Defaults keep the local deploy identical.
+    compute_backend: Literal["local", "aws_batch"] = "local"
+    aws_region: str = ""
+    batch_job_queue: str = ""
+    batch_job_definition: str = ""
+    # Max in-flight Batch jobs per firmware (aws_batch mode). Shared-instance
+    # fairness guardrail: bounds a runaway agent looping start_binary_analysis /
+    # start_function_decompile so one analyst's firmware can't saturate the queue
+    # under batch_max_vcpus. A firmware belongs to one project/analyst, so this is
+    # the per-project/per-user cap realized on the one identity available at every
+    # dispatch site (per-user proper needs the deferred ALB-Cognito identity). 0
+    # disables the cap. No effect in local mode.
+    batch_max_jobs_per_firmware: int = 8
+    # TTL (seconds) for the distributed analysis lock used when compute_backend
+    # != "local" (no shared filesystem for flock). Auto-renewed while held, so
+    # this only bounds how long a crashed holder blocks others.
+    redis_lock_ttl_seconds: int = 120
+    # Idle timeout for the cloud "reuse worker" (C8). It stays warm while reuse
+    # requests keep arriving and exits after this long with an empty queue.
+    re_worker_idle_ttl_minutes: int = 20
+
+    # --- Auth (OIDC / JWT bearer) ------------------------------------------
+    # Enforce bearer-token auth on the HTTP API. Default off keeps the local
+    # docker-compose deploy open and unauthenticated. When on, every request
+    # (outside the allowlist) needs a valid OIDC access token; the SPA obtains
+    # one via the Cognito hosted-UI login. IdP-agnostic: point oidc_issuer at
+    # the deployment's Cognito pool, or any OIDC issuer — so an operator can
+    # federate JumpCloud/Okta into Cognito (or use them directly) without a
+    # code change. Does not affect the MCP server (it calls services directly).
+    auth_enabled: bool = False
+    # e.g. https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
+    oidc_issuer: str = ""
+    # App client id; matched against the token's `aud` or (Cognito) `client_id`.
+    oidc_audience: str = ""
+    # Defaults to "<oidc_issuer>/.well-known/jwks.json" when blank.
+    oidc_jwks_url: str = ""
 
 
 @lru_cache

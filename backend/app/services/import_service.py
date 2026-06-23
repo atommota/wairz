@@ -117,6 +117,9 @@ class ImportService:
             await self._import_firmware(zf, old_fw_id_str, new_project_id, id_map)
         await self.db.flush()
 
+        # ── Restore bundled kernels (global resource) ──────────────
+        self._import_kernels(zf)
+
         # ── Import findings, documents, emulation presets ─────────
         await self._import_findings(zf, new_project_id, id_map)
         await self._import_documents(zf, new_project_id, id_map)
@@ -134,6 +137,29 @@ class ImportService:
 
         await self.db.flush()
         return project
+
+    def _import_kernels(self, zf: zipfile.ZipFile) -> None:
+        """Write bundled kernels into the global kernel dir if not present.
+
+        Lets a system-mode emulation preset boot after import without the user
+        manually re-uploading the kernel. Existing kernels of the same name are
+        left untouched (don't clobber a possibly-newer local copy).
+        """
+        kernel_dir = self.settings.emulation_kernel_dir
+        os.makedirs(kernel_dir, exist_ok=True)
+        for name in zf.namelist():
+            if not name.startswith("kernels/") or name.endswith("/"):
+                continue
+            base = os.path.basename(name)
+            if not base or base == "manifest.json":
+                continue
+            # zip-slip already validated in import_project; basename only.
+            dest = os.path.join(kernel_dir, base)
+            if os.path.exists(dest):
+                continue
+            with zf.open(name) as src, open(dest, "wb") as dst:
+                while chunk := src.read(65536):
+                    dst.write(chunk)
 
     # ── Firmware ───────────────────────────────────────────────────
 
@@ -197,6 +223,15 @@ class ImportService:
             extracted_path = os.path.join(fw_dir, "_extracted")
             os.makedirs(extracted_path, exist_ok=True)
             self._extract_filesystem(zf, extracted_prefix, extracted_path)
+
+        # Restore the carved/output dir (built harnesses, run_shell outputs)
+        # to <fw_dir>/carved so the /_carved virtual paths (and any
+        # harness_binary in a fuzzing campaign config) resolve after import.
+        carved_prefix = f"{prefix}/carved/"
+        if any(n.startswith(carved_prefix) and n != carved_prefix for n in zf.namelist()):
+            carved_path = os.path.join(fw_dir, "carved")
+            os.makedirs(carved_path, exist_ok=True)
+            self._extract_filesystem(zf, carved_prefix, carved_path)
 
         # firmware_kind was added after the initial archive format; pre-RTOS
         # exports omit it. Infer linux when there's an extracted rootfs,

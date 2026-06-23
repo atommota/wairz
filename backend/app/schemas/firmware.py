@@ -39,6 +39,35 @@ class FirmwareKindUpdate(BaseModel):
         return self
 
 
+Endianness = Literal["little", "big"]
+RedetectTarget = Literal["rootfs", "arch", "kernel"]
+
+
+class FirmwareArchUpdate(BaseModel):
+    """Manual architecture override for firmware the unpacker couldn't fingerprint."""
+
+    architecture: str
+    endianness: Endianness | None = None
+
+
+class FirmwareRootfsUpdate(BaseModel):
+    """Designate a directory (virtual firmware path) as the emulation/analysis root."""
+
+    path: str
+
+
+class FirmwareKernelUpdate(BaseModel):
+    """Designate a file (virtual firmware path) as the emulation kernel image."""
+
+    path: str
+
+
+class FirmwareRedetectRequest(BaseModel):
+    """Re-run unpack detection; targets defaults to all when omitted."""
+
+    targets: list[RedetectTarget] | None = None
+
+
 class FirmwareDetailResponse(BaseModel):
     model_config = {"from_attributes": True}
 

@@ -33,6 +33,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         kernels: ./emulation/kernels
+        ghidra_scripts: ./ghidra/scripts
       args:
         DOCKER_GID: "${DOCKER_GID:-999}"
     ports:
@@ -54,6 +55,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - firmware_data:/data/firmware
+      - ghidra_projects:/data/ghidra_projects
       - ./ghidra/scripts:/opt/ghidra_scripts:ro
       - ./emulation/kernels:/opt/kernels:rw
       - /var/run/docker.sock:/var/run/docker.sock
@@ -103,6 +105,16 @@ services:
     profiles:
       - build-only
 
+  # Image-only: cross-compile sandbox for fuzzing harnesses linked against a
+  # firmware .so. Spawned network-less by the backend via the Docker SDK.
+  harness-build:
+    build:
+      context: ./harness-build
+      dockerfile: Dockerfile
+    image: wairz-harness-build
+    profiles:
+      - build-only
+
   frontend:
     build:
       context: ./frontend
@@ -118,6 +130,7 @@ volumes:
   pgdata:
   redisdata:
   firmware_data:
+  ghidra_projects:
 
 networks:
   emulation_net:

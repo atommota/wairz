@@ -30,8 +30,8 @@ from app.database import async_session_factory
 from app.services.ghidra_service import (
     _cross_process_analysis_lock,
     _parse_decompile_output,
+    _run_ghidra_local,
     get_analysis_cache,
-    run_ghidra_subprocess,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,11 +76,17 @@ async def _run(
                     await recheck_db.commit()
                     return 0
 
-            raw_output = await run_ghidra_subprocess(
+            # Run Ghidra in-process: this worker IS the compute box (its own
+            # Batch instance / local host). Going through run_ghidra_subprocess
+            # would re-dispatch to the cloud reuse worker (batch:SubmitJob),
+            # which this worker's role can't and shouldn't do — it would just
+            # bounce the work back to Batch recursively.
+            raw_output = await _run_ghidra_local(
                 binary_path,
                 "DecompileFunction.java",
-                script_args=[function_name],
-                timeout=get_settings().ghidra_background_decompile_timeout,
+                [function_name],
+                get_settings().ghidra_background_decompile_timeout,
+                binary_sha256,
             )
             decompiled = _parse_decompile_output(raw_output)
 

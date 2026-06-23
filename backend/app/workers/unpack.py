@@ -34,6 +34,26 @@ _ELF_ARCH_MAP = {
     "EM_SPARC": "sparc",
 }
 
+# Map U-Boot uImage architecture codes (ih_arch byte) to (friendly name,
+# default endianness). The uImage header does not encode target endianness,
+# so we use the conventional default for each architecture — these values are
+# only consulted as a last-resort fallback when no ELF binary could be found.
+_UIMAGE_ARCH_MAP = {
+    2: ("arm", "little"),
+    21: ("aarch64", "little"),
+    3: ("x86", "little"),
+    23: ("x86_64", "little"),
+    5: ("mips", "big"),
+    6: ("mips64", "big"),
+    7: ("ppc", "big"),
+    9: ("sh", "little"),
+    10: ("sparc", "big"),
+    11: ("sparc64", "big"),
+    25: ("riscv", "little"),
+}
+
+_UBOOT_MAGIC = b"\x27\x05\x19\x56"
+
 
 async def run_binwalk_extraction(firmware_path: str, output_dir: str, timeout: int = 1800) -> str:
     """Run binwalk with matryoshka recursion to extract firmware contents.
@@ -149,16 +169,46 @@ def find_filesystem_root(extraction_dir: str) -> str | None:
     return None
 
 
+def _classify_elf(path: str) -> tuple[str, str] | None:
+    """Return (arch, endianness) for an ELF at *path*, or None if not an ELF.
+
+    Centralises the e_machine -> friendly-name mapping and the mips/mipsel
+    endianness split so every detection path stays consistent.
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                return None
+            f.seek(0)
+            elf = ELFFile(f)
+            arch = _ELF_ARCH_MAP.get(elf.header.e_machine, elf.header.e_machine)
+            endianness = "little" if elf.little_endian else "big"
+            # For MIPS, distinguish mips vs mipsel
+            if arch == "mips" and endianness == "little":
+                arch = "mipsel"
+            return arch, endianness
+    except Exception:
+        return None
+
+
 def detect_architecture(fs_root: str) -> tuple[str | None, str | None]:
     """Detect architecture and endianness by examining ELF binaries.
 
-    Uses majority voting across all ELF binaries found in common directories
-    to handle mixed-architecture filesystems (e.g., ARM firmware with x86-64
-    systemd from a host layer).
+    Uses majority voting across ELF binaries to handle mixed-architecture
+    filesystems (e.g., ARM firmware with x86-64 systemd from a host layer).
+
+    Two passes:
+
+    1. Scan the conventional binary directories (``bin``, ``sbin``, ``lib``…).
+       This is fast and right for a standard FHS rootfs.
+    2. If that finds nothing — e.g. a vendor ``/app`` partition whose
+       executables live at the *top level* with empty ``bin``/``lib`` dirs
+       (Wyze Chime Pro and similar) — walk the whole tree as a fallback and
+       vote across any ELFs found, capping the work to stay bounded.
     """
     from collections import Counter
 
-    # Look for ELF binaries in common dirs
+    # Pass 1: conventional binary directories.
     search_dirs = ["bin", "usr/bin", "sbin", "usr/sbin", "lib"]
     votes: Counter[tuple[str, str]] = Counter()
     max_scan = 50  # Cap scanning to avoid slowness on huge filesystems
@@ -167,43 +217,74 @@ def detect_architecture(fs_root: str) -> tuple[str | None, str | None]:
         search_path = os.path.join(fs_root, search_dir)
         if not os.path.isdir(search_path):
             continue
-
         try:
             entries = os.listdir(search_path)
         except OSError:
             continue
-
         for entry in entries:
             if sum(votes.values()) >= max_scan:
                 break
-
             full_path = os.path.join(search_path, entry)
-            if not os.path.isfile(full_path):
+            if not os.path.isfile(full_path) or os.path.islink(full_path):
                 continue
-            try:
-                with open(full_path, "rb") as f:
-                    magic = f.read(4)
-                    if magic != b"\x7fELF":
-                        continue
-                    f.seek(0)
-                    elf = ELFFile(f)
-                    arch = _ELF_ARCH_MAP.get(elf.header.e_machine, elf.header.e_machine)
-                    endianness = "little" if elf.little_endian else "big"
+            classified = _classify_elf(full_path)
+            if classified is not None:
+                votes[classified] += 1
 
-                    # For MIPS, distinguish mips vs mipsel
-                    if arch == "mips" and endianness == "little":
-                        arch = "mipsel"
+    if votes:
+        (arch, endianness), _count = votes.most_common(1)[0]
+        return arch, endianness
 
-                    votes[(arch, endianness)] += 1
-            except Exception:
+    # Pass 2: nothing in the usual places — walk the whole tree. Bound the
+    # work by both the number of ELF votes and the number of files inspected
+    # so a huge filesystem can't stall the unpack.
+    examined = 0
+    max_examined = 4000
+    for root, _dirs, files in os.walk(fs_root):
+        for name in files:
+            if sum(votes.values()) >= max_scan or examined >= max_examined:
+                break
+            full_path = os.path.join(root, name)
+            if not os.path.isfile(full_path) or os.path.islink(full_path):
                 continue
+            examined += 1
+            classified = _classify_elf(full_path)
+            if classified is not None:
+                votes[classified] += 1
+        if sum(votes.values()) >= max_scan or examined >= max_examined:
+            break
 
     if not votes:
         return None, None
 
-    # Return the most common architecture
     (arch, endianness), _count = votes.most_common(1)[0]
     return arch, endianness
+
+
+def detect_architecture_from_uboot(firmware_path: str) -> tuple[str | None, str | None]:
+    """Last-resort arch detection from a U-Boot uImage header.
+
+    When no ELF binary can be found in the extracted tree (e.g. the rootfs
+    didn't reconstruct, or only a kernel/RTOS blob was carved), the uImage
+    header on the raw image still declares the target architecture. The
+    header doesn't carry target endianness, so we fall back to the
+    conventional default per architecture (see ``_UIMAGE_ARCH_MAP``).
+
+    Returns (None, None) if no uImage header is present.
+    """
+    try:
+        with open(firmware_path, "rb") as f:
+            head = f.read(256 * 1024)
+    except OSError:
+        return None, None
+
+    idx = 0 if head[:4] == _UBOOT_MAGIC else head.find(_UBOOT_MAGIC)
+    if idx < 0 or idx + 30 > len(head):
+        return None, None
+
+    # The architecture lives in byte 29 (ih_arch) of the 64-byte header.
+    ih_arch = head[idx + 29]
+    return _UIMAGE_ARCH_MAP.get(ih_arch, (None, None))
 
 
 def detect_os_info(fs_root: str) -> str | None:
@@ -516,8 +597,17 @@ async def unpack_firmware(firmware_path: str, output_base_dir: str) -> UnpackRes
             fs_root_real, extraction_dir_real
         )
 
-    # Step 3: Detect architecture
+    # Step 3: Detect architecture. Prefer fingerprinting extracted ELFs; if
+    # the tree has none we can fingerprint (kernel-only / odd layouts), fall
+    # back to the raw image's U-Boot uImage architecture field.
     arch, endian = detect_architecture(fs_root)
+    if arch is None:
+        arch, endian = detect_architecture_from_uboot(firmware_path)
+        if arch is not None:
+            result.unpack_log = (
+                (result.unpack_log or "")
+                + f"\narch detection: fell back to uImage header -> {arch}/{endian}"
+            )
     result.architecture = arch
     result.endianness = endian
 

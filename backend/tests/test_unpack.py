@@ -4,11 +4,63 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import struct
+
 from app.workers.unpack import (
     _count_fs_markers,
     _has_linux_markers,
+    detect_architecture,
+    detect_architecture_from_uboot,
     find_filesystem_root,
 )
+
+
+def _elf32(machine: int, little: bool = True, etype: int = 3) -> bytes:
+    """Build a minimal but parseable 52-byte ELF32 header.
+
+    Only the header fields matter to ``_classify_elf`` (e_machine + EI_DATA);
+    e_phoff/e_shoff are zeroed so pyelftools never tries to parse absent
+    program/section tables.
+    """
+    ei_data = 1 if little else 2  # ELFDATA2LSB / ELFDATA2MSB
+    e_ident = b"\x7fELF" + bytes([1, ei_data, 1, 0]) + b"\x00" * 8
+    endian = "<" if little else ">"
+    rest = struct.pack(
+        endian + "HHIIIIIHHHHHH",
+        etype,      # e_type
+        machine,    # e_machine
+        1,          # e_version
+        0,          # e_entry
+        0,          # e_phoff
+        0,          # e_shoff
+        0,          # e_flags
+        52,         # e_ehsize
+        0, 0, 0, 0, 0,  # ph/sh entsize/num, shstrndx
+    )
+    return e_ident + rest
+
+
+def _uimage_header(arch_code: int) -> bytes:
+    """Build a 64-byte U-Boot uImage header with the given ih_arch code."""
+    return struct.pack(
+        ">IIIIIIIBBBB",
+        0x27051956,  # ih_magic
+        0,           # ih_hcrc
+        0,           # ih_time
+        0,           # ih_size
+        0,           # ih_load
+        0,           # ih_ep
+        0,           # ih_dcrc
+        5,           # ih_os = Linux
+        arch_code,   # ih_arch
+        2,           # ih_type = Kernel
+        0,           # ih_comp
+    ) + b"Linux-test\x00" + b"\x00" * 21
+
+
+# ARM = 40 (0x28) in ELF e_machine; ARM = 2 in U-Boot ih_arch.
+_EM_ARM = 40
+_EM_MIPS = 8
 
 
 def _make_dirs(base: Path, layout: dict) -> None:
@@ -141,3 +193,69 @@ class TestFindFilesystemRoot:
         result = find_filesystem_root(str(tmp_path))
         assert result is not None
         assert os.path.basename(result) == "squashfs-root"
+
+
+class TestDetectArchitecture:
+    def test_detects_arm_from_conventional_dirs(self, tmp_path: Path):
+        _make_dirs(tmp_path, {"bin": {"busybox": _elf32(_EM_ARM)}})
+        assert detect_architecture(str(tmp_path)) == ("arm", "little")
+
+    def test_falls_back_to_top_level_elfs(self, tmp_path: Path):
+        # Wyze /app-style partition: empty bin/ and lib/, executables at the
+        # top level. Pass 1 finds nothing; the tree-walk fallback must catch
+        # the top-level ELFs.
+        _make_dirs(tmp_path, {
+            "bin": {},
+            "lib": {},
+            "chime_app": _elf32(_EM_ARM),
+            "hostapd": _elf32(_EM_ARM),
+            "setup.sh": b"#!/bin/sh\n",
+        })
+        assert detect_architecture(str(tmp_path)) == ("arm", "little")
+
+    def test_mipsel_split(self, tmp_path: Path):
+        _make_dirs(tmp_path, {"bin": {"busybox": _elf32(_EM_MIPS, little=True)}})
+        assert detect_architecture(str(tmp_path)) == ("mipsel", "little")
+
+    def test_big_endian_mips(self, tmp_path: Path):
+        _make_dirs(tmp_path, {"bin": {"busybox": _elf32(_EM_MIPS, little=False)}})
+        assert detect_architecture(str(tmp_path)) == ("mips", "big")
+
+    def test_majority_vote_wins(self, tmp_path: Path):
+        _make_dirs(tmp_path, {"bin": {
+            "a": _elf32(_EM_ARM), "b": _elf32(_EM_ARM),
+            "c": _elf32(_EM_MIPS, little=False),
+        }})
+        assert detect_architecture(str(tmp_path)) == ("arm", "little")
+
+    def test_returns_none_without_elfs(self, tmp_path: Path):
+        _make_dirs(tmp_path, {"bin": {"script.sh": b"#!/bin/sh\n"}})
+        assert detect_architecture(str(tmp_path)) == (None, None)
+
+    def test_ignores_symlinks(self, tmp_path: Path):
+        # A dangling/cyclic symlink must not crash the walk.
+        _make_dirs(tmp_path, {"app": _elf32(_EM_ARM)})
+        os.symlink(tmp_path / "missing", tmp_path / "broken")
+        assert detect_architecture(str(tmp_path)) == ("arm", "little")
+
+
+class TestDetectArchitectureFromUboot:
+    def test_arm_uimage(self, tmp_path: Path):
+        blob = tmp_path / "fw.bin"
+        blob.write_bytes(_uimage_header(2))  # ih_arch 2 = ARM
+        assert detect_architecture_from_uboot(str(blob)) == ("arm", "little")
+
+    def test_mips_uimage(self, tmp_path: Path):
+        blob = tmp_path / "fw.bin"
+        blob.write_bytes(_uimage_header(5))  # ih_arch 5 = MIPS
+        assert detect_architecture_from_uboot(str(blob)) == ("mips", "big")
+
+    def test_magic_not_at_offset_zero(self, tmp_path: Path):
+        blob = tmp_path / "fw.bin"
+        blob.write_bytes(b"\x00" * 4096 + _uimage_header(2))
+        assert detect_architecture_from_uboot(str(blob)) == ("arm", "little")
+
+    def test_no_uimage_returns_none(self, tmp_path: Path):
+        blob = tmp_path / "fw.bin"
+        blob.write_bytes(b"not a uimage at all" * 100)
+        assert detect_architecture_from_uboot(str(blob)) == (None, None)
