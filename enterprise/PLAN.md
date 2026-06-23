@@ -724,42 +724,45 @@ independent**. MCP TG `/healthz` healthy; SPA + REST API unaffected.
 > out-of-scope features in the cloud build (no `docker.sock`/privileged worker in
 > Fargate). Remote MCP does **not** depend on them.
 
-### Phase 6 — Cloud-MCP UX hardening — ⏳ NOT STARTED
+### Phase 6 — Cloud-MCP UX hardening — 🟢 MOSTLY DONE (1 low-pri item open)
 
 From the **first real agent session** driving the cloud MCP end-to-end
 (2026-06-12; full triage in `docs/MCP-FIELD-FINDINGS.md`). The Batch-dispatch
-chain that dominated that session is fixed (§4 batch fixes); what remains are
-transport/UX issues that cost the agent the most time.
+chain that dominated that session is fixed (§4 batch fixes); what remained were
+transport/UX issues that cost the agent the most time. A 2026-06-14 live cloud
+re-test surfaced the last transport bug (#1) and it is now fixed. **Only item #3
+(persist active project across reconnect) remains, and it is low-priority UX
+polish — not a merge blocker.**
 
 **Already fixed in that session (context, not work):** the mid-session task
 reaping (root cause = boto3 hang on the missing `batch` VPC endpoint, §4) and the
 one-off `batch:TagResource` IAM-propagation error. Those won't recur.
 
-**Open — in priority order:**
+**Status — in original priority order:**
 
-1. **Typed, retryable errors instead of CloudFront HTML.** When the origin is
-   down/slow, CloudFront serves its HTML error page (and the SPA `custom_error_
-   response` rewrites 4xx→`index.html`), so the MCP client gets
-   `Unexpected content type: text/html` — indistinguishable from a real result.
-   The agent had to regex HTML to guess intent, and repeatedly mis-concluded
-   "backend is down" when a heavy job was merely slow. **Highest leverage.**
-   Options: a dedicated CloudFront error-response config for `/mcp*` (don't apply
-   the SPA index.html rewrite to the API/MCP paths); ensure the sidecar emits
-   proper JSON-RPC errors with a `retryable` hint; consider a short origin
-   `read_timeout` + explicit 504 JSON rather than a hung edge.
-2. **Async job handles for heavy RE tools.** `decompile_function` /
-   `list_functions` block synchronously and 504 at CloudFront's 60s edge on a
-   cold cache, while `start_binary_analysis` is the async fire-and-poll path. New
-   users won't know to call the async one first. Make the sync tools detect a
-   cold cache and **return a job handle** (or auto-route to the async path)
-   instead of blocking. Ties into the broader "don't block the sidecar event
-   loop on synchronous boto3/Ghidra" hardening (run them in a threadpool so
-   `/healthz` and concurrent calls stay responsive — this is also what made
-   `check_binary_analysis_status` itself 504 during cold start).
-3. **Persist active project across reconnect.** A `/mcp` reconnect starts a fresh
-   MCP session → empty `ProjectState` → every tool returns "No project is active"
-   until `switch_project` is re-run. Re-bind the last project server-side keyed
-   to the token/user (or have the client re-issue `switch_project` on reconnect).
+1. **✅ DONE — Typed, retryable errors instead of CloudFront HTML** (`c2c5355`).
+   The distribution-wide `custom_error_response` (403/404→`index.html`) also
+   caught the ALB/MCP origin, so an unknown/stale `Mcp-Session-Id` (a backend
+   404) came back as `200 text/html` and wedged the Streamable-HTTP client on
+   `Unexpected content type: text/html` after every backend roll. Replaced with
+   an `aws_cloudfront_function` (viewer-request) attached to the S3 default
+   behavior only: extension-less deep links rewrite to `/index.html`, while
+   `/api/*` and `/mcp*` keep their own behaviors and return honest 404s. Stale
+   sessions now re-initialize cleanly across redeploys. (Full repro +
+   resolution in `docs/MCP-FIELD-FINDINGS.md`.)
+2. **✅ DONE — Async job handles for heavy RE tools** (`3f44b89`, `5c9b72a`,
+   `a110bed`). `decompile_function` / `list_functions` no longer block to the
+   CloudFront 60s edge on a cold cache: a cache hit is served directly, otherwise
+   the call returns an async "analyzing — poll" job handle routed to the
+   decompile/analysis worker. boto3 calls are wrapped in `asyncio.to_thread` so
+   the sidecar event loop (and `/healthz`) stay responsive during dispatch.
+3. **⏳ OPEN (low priority) — Persist active project across reconnect.** A `/mcp`
+   reconnect starts a fresh MCP session → empty `ProjectState` → every tool
+   returns "No project is active" until `switch_project` is re-run. Re-bind the
+   last project server-side keyed to the token/user (or have the client re-issue
+   `switch_project` on reconnect). Cosmetic one-call workaround exists
+   (`switch_project`); deferred until the deferred ALB-Cognito identity is
+   plumbed through the transport. **Not a merge blocker.**
 
 The **core-product tool bugs** the same session surfaced (PLT/import-stub
 blindness in `decompile_function`, `resolve_import` false negatives,
@@ -767,6 +770,8 @@ decompile/disassemble-by-address, `hexdump_data` unimplemented, `search_strings`
 param naming, `warm_analysis_worker` not coupled to readiness) are **not
 cloud-specific** — they reproduce on a local install — and are tracked separately
 in `docs/MCP-FIELD-FINDINGS.md` against `main`/the product, not this branch.
+Most are now fixed (`3f44b89`, `a110bed`); `warm_analysis_worker` readiness
+coupling (core #6) remains open and low-priority.
 
 ---
 

@@ -91,8 +91,14 @@ viewer-request Function that rewrites only extension-less, non-`/mcp`, non-`/api
 paths to `/index.html`, then drop the distribution-wide `custom_error_response`.
 Minimal-risk alternative: drop only the `404→index.html` rewrite and keep
 `403→index.html` (S3+OAC returns 403 for missing keys, so SPA routing survives;
-MCP returns 404 for unknown sessions, which would then reach the client). Still
-open (Phase 6 #1) — needs a conscious SPA-routing change, not done unilaterally.
+MCP returns 404 for unknown sessions, which would then reach the client).
+
+**✅ Fixed (`c2c5355`)** with the recommended approach: an
+`aws_cloudfront_function` (viewer-request) attached to the S3 default behavior
+rewrites only extension-less deep links to `/index.html`; `/api/*` and `/mcp*`
+keep their own behaviors and pass 404s through honestly, and the
+distribution-wide `custom_error_response` is dropped. Stale `Mcp-Session-Id`
+now re-initializes cleanly across a backend roll.
 
 ### Minor (cosmetic) — background-decompiled output carries Ghidra log prefixes
 Functions decompiled via the one-shot/background worker come back with per-line
@@ -100,15 +106,19 @@ Functions decompiled via the one-shot/background worker come back with per-line
 the synchronous/reuse-worker path is clean. Readable but noisier; the background
 path should strip the headless log prefix the same way the sync path does.
 
+**✅ Fixed (`c2c5355`)** — `_parse_decompile_output` now strips the per-line
+level+script prefix and the trailing `(GhidraScript)` marker, cleaning both the
+sync and background paths; regression test in `test_ghidra_decompile_parse.py`.
+
 ---
 
-## Fix status (updated 2026-06-14)
+## Fix status (updated 2026-06-22)
 
 | Item | Status |
 |---|---|
 | Cloud (2026-06-14) one-shot decompile worker re-dispatched to Batch (SubmitJob denial) | ✅ **fixed** (`7fdc84b`) — worker runs Ghidra in-process via `_run_ghidra_local`; live-validated job SUCCEEDED + cached result |
-| Cloud #1 CloudFront HTML masks 404 → breaks MCP reconnection after backend roll | ⏳ open (upgraded HIGH) — hard repro captured; fix = decouple SPA routing from global error rewrite |
-| Cloud background-decompile output carries Ghidra `INFO …>` log prefixes | ⏳ open (cosmetic) |
+| Cloud #1 CloudFront HTML masks 404 → breaks MCP reconnection after backend roll | ✅ **fixed** (`c2c5355`) — SPA routing moved to an `aws_cloudfront_function` on the S3 behavior only; `/api/*` and `/mcp*` keep their own behaviors and return honest 404s, so a stale `Mcp-Session-Id` re-initializes cleanly instead of wedging on `text/html` |
+| Cloud background-decompile output carries Ghidra `INFO …>` log prefixes | ✅ **fixed** (`c2c5355`) — `_parse_decompile_output` strips the per-line level+script prefix and the trailing `(GhidraScript)` marker (sync + background paths); regression test added |
 | Core #1 PLT/import-stub blindness | ✅ **fixed** (`3f44b89`) — detect thunk/import → route to resolve_import; live-validated (0.9s vs 600s hang) |
 | Core #2 resolve_import false negative | ✅ **fixed** (`3f44b89`) — whole-rootfs lib search + precise "why" diagnostics; live-validated (found pingTest in libsml.so) |
 | Core #3 no decompile/disassemble by address | ✅ **fixed** (`a110bed`) — decompile_function accepts `0x…` (now incl. getFunctionContaining), documented |
@@ -118,7 +128,7 @@ path should strip the headless log prefix the same way the sync path does.
 | Cloud #2 sync tools 504 on cold cache | ✅ **fixed** (`3f44b89`) — async "analyzing — poll" handle |
 | Cloud #2c decompile_function 504s on cache-miss (uncached/by-address) | ✅ **fixed** (`5c9b72a`) — cache hit served direct, else routed to async decompile worker; live-validated (0.8s handle vs 60s timeout) |
 | Cloud #2b status-poll / dispatch blocks event loop | ✅ **mitigated** (`a110bed`) — boto3 wrapped in `asyncio.to_thread` |
-| Cloud #1 CloudFront HTML error pages | ⏳ open — largely subsumed (fewer 504s); residual is CloudFront's own page on origin-down |
+| Cloud #1 CloudFront HTML error pages | ✅ **resolved** (`c2c5355`) — API/MCP paths no longer get the SPA index.html rewrite; residual is only CloudFront's genuine edge page when the origin is actually down (expected) |
 | Cloud #3 persist active project across reconnect | ⏳ open — needs token-identity plumbing through the transport |
 
 The per-item detail below is retained for the open items + as a record.
@@ -176,8 +186,12 @@ The per-item detail below is retained for the open items + as a record.
 ---
 
 ## Highest-leverage, across both buckets
-1. Typed/retryable errors instead of CloudFront HTML (cloud #1).
-2. PLT/import-stub detection → route to `resolve_import`; make `resolve_import`
-   work without manual pre-analysis (core #1 + #2).
-3. Persist active project across reconnect (cloud #3).
-4. Job handle for sync RE tools on cold cache (cloud #2).
+1. ✅ Typed/retryable errors instead of CloudFront HTML (cloud #1) — fixed (`c2c5355`).
+2. ✅ PLT/import-stub detection → route to `resolve_import`; make `resolve_import`
+   work without manual pre-analysis (core #1 + #2) — fixed (`3f44b89`).
+3. ⏳ Persist active project across reconnect (cloud #3) — **still open**; needs
+   token-identity plumbing through the transport.
+4. ✅ Job handle for sync RE tools on cold cache (cloud #2) — fixed (`3f44b89` / `5c9b72a`).
+
+**Remaining open:** cloud #3 (persist project across reconnect) and core #6
+(`warm_analysis_worker` readiness coupling) — both low-priority UX polish.

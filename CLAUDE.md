@@ -263,6 +263,37 @@ See `.env.example` for defaults. Key variables:
 
 ---
 
+## Enterprise / Cloud Deployment (`enterprise/`)
+
+The `enterprise/` directory is a self-contained AWS deployment target (Terraform)
+that runs Wairz elastically: SPA on S3/CloudFront, FastAPI on Fargate, Aurora
+Serverless v2, ElastiCache, EFS-shared firmware storage, and Ghidra
+decompilation bursting onto **scale-to-zero AWS Batch** workers. It also adds an
+optional custom domain + Cognito/OIDC auth (SSO-ready) and a remote
+Streamable-HTTP MCP transport.
+
+**The non-negotiable contract when touching app code: every cloud behavior is
+config-gated and defaults to the local behavior.** The single-host
+`docker compose` workflow must keep working unchanged with the default settings,
+and the existing test suite must stay green with defaults. Concretely:
+
+- Cloud features are toggled by settings (e.g. `auth_enabled`, Batch dispatch,
+  Redis-backed analysis lock, `allowed_hosts`/`allowed_origins`,
+  `mcp_http_enabled`) whose **defaults reproduce the original local behavior**.
+- Firmware storage stays a POSIX path (EFS) — do not migrate `STORAGE_ROOT` to an
+  S3-only abstraction.
+- Keep the existing async job protocol (`analysis_cache` / `ghidra_analysis_run` +
+  poll tools); the enterprise change only moves *where* Ghidra runs and *what
+  backs the cross-process lock*.
+- `docker.sock` features (fuzzing, emulation, carving) are **out of scope for the
+  cloud MVP** but must gate off gracefully, not be hard-removed.
+
+Start at [`enterprise/PLAN.md`](enterprise/PLAN.md) — its "Codebase Ground Truth"
+and "Guardrails for agents" sections are required reading before changing
+anything in this subtree. Operations/cost detail is in `enterprise/docs/`.
+
+---
+
 ## Testing Firmware
 
 Good images for development and testing:

@@ -18,7 +18,11 @@ set your variables, and apply the Terraform.
 > CloudWatch alarms/dashboard are in place; the Fargate image is slimmed (no
 > Ghidra); an optional custom domain + Cognito/OIDC login (SSO-ready — federate
 > JumpCloud/Okta into the pool) is flag-gated and live-validated; and
-> `docs/RUNBOOK.md` + `docs/COST.md` document operations and cost.
+> `docs/RUNBOOK.md` + `docs/COST.md` document operations and cost. **Phase 5
+> (remote Streamable-HTTP MCP transport) is complete and live-validated**, and
+> the Phase 6 cloud-MCP UX hardening is done except one low-priority item
+> (persist active project across reconnect) — see PLAN.md §5–6 and
+> `docs/MCP-FIELD-FINDINGS.md`. None of these is a merge blocker.
 
 ## Why this exists
 
