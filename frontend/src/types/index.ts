@@ -141,6 +141,12 @@ export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info'
 export type FindingStatus = 'open' | 'confirmed' | 'false_positive' | 'fixed'
 export type FindingSource = 'manual' | 'ai_discovered' | 'sbom_scan' | 'fuzzing' | 'security_review'
 
+export interface FindingFirmwareVersion {
+  id: string
+  version_label: string | null
+  original_filename: string | null
+}
+
 export interface Finding {
   id: string
   project_id: string
@@ -156,6 +162,7 @@ export interface Finding {
   status: FindingStatus
   source: FindingSource
   component_id: string | null
+  firmware_versions: FindingFirmwareVersion[]
   created_at: string
   updated_at: string
 }
@@ -171,6 +178,7 @@ export interface FindingCreate {
   cwe_ids?: string[]
   conversation_id?: string
   source?: FindingSource
+  firmware_ids?: string[]
 }
 
 export interface FindingUpdate {
@@ -184,6 +192,7 @@ export interface FindingUpdate {
   cwe_ids?: string[]
   status?: FindingStatus
   source?: FindingSource
+  firmware_ids?: string[]
 }
 
 // ── SBOM types ──

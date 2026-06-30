@@ -2,7 +2,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import { ShieldAlert, Loader2 } from 'lucide-react'
 import { listFindings, updateFinding, deleteFinding } from '@/api/findings'
-import type { Finding, FindingUpdate, Severity, FindingStatus, FindingSource } from '@/types'
+import { listFirmware } from '@/api/firmware'
+import type { Finding, FindingUpdate, Severity, FindingStatus, FindingSource, FirmwareDetail } from '@/types'
 import FindingsList from '@/components/findings/FindingsList'
 import FindingDetail from '@/components/findings/FindingDetail'
 import ReportExport from '@/components/findings/ReportExport'
@@ -11,11 +12,13 @@ export default function FindingsPage() {
   const { projectId } = useParams<{ projectId: string }>()
 
   const [findings, setFindings] = useState<Finding[]>([])
+  const [firmwareVersions, setFirmwareVersions] = useState<FirmwareDetail[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [severityFilter, setSeverityFilter] = useState<Severity | null>(null)
   const [statusFilter, setStatusFilter] = useState<FindingStatus | null>(null)
   const [sourceFilter, setSourceFilter] = useState<FindingSource | null>(null)
+  const [firmwareFilter, setFirmwareFilter] = useState<string | null>(null)
 
   const fetchFindings = useCallback(async () => {
     if (!projectId) return
@@ -24,6 +27,7 @@ export default function FindingsPage() {
       if (severityFilter) params.severity = severityFilter
       if (statusFilter) params.status = statusFilter
       if (sourceFilter) params.source = sourceFilter
+      if (firmwareFilter) params.firmware_id = firmwareFilter
       const data = await listFindings(projectId, params)
       setFindings(data)
     } catch (err) {
@@ -31,11 +35,18 @@ export default function FindingsPage() {
     } finally {
       setLoading(false)
     }
-  }, [projectId, severityFilter, statusFilter, sourceFilter])
+  }, [projectId, severityFilter, statusFilter, sourceFilter, firmwareFilter])
 
   useEffect(() => {
     fetchFindings()
   }, [fetchFindings])
+
+  useEffect(() => {
+    if (!projectId) return
+    listFirmware(projectId)
+      .then(setFirmwareVersions)
+      .catch((err) => console.error('Failed to load firmware versions:', err))
+  }, [projectId])
 
   const handleSelect = useCallback((finding: Finding) => {
     setSelectedId((prev) => (prev === finding.id ? null : finding.id))
@@ -92,9 +103,12 @@ export default function FindingsPage() {
             severityFilter={severityFilter}
             statusFilter={statusFilter}
             sourceFilter={sourceFilter}
+            firmwareVersions={firmwareVersions}
+            firmwareFilter={firmwareFilter}
             onSeverityFilter={setSeverityFilter}
             onStatusFilter={setStatusFilter}
             onSourceFilter={setSourceFilter}
+            onFirmwareFilter={setFirmwareFilter}
           />
         </div>
       </div>
@@ -106,6 +120,7 @@ export default function FindingsPage() {
             <FindingDetail
               key={selectedFinding.id}
               finding={selectedFinding}
+              firmwareVersions={firmwareVersions}
               onUpdate={handleUpdate}
               onDelete={handleDelete}
             />

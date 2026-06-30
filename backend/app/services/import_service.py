@@ -9,6 +9,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -371,6 +372,20 @@ class ImportService:
                 status=f.get("status", "open"),
                 source=f.get("source", "manual"),
             )
+            # Re-tag affected firmware versions. Firmware is imported before
+            # findings, so old→new firmware ids are already in id_map.
+            new_fw_ids = [
+                id_map[old_fw_id]
+                for old_fw_id in (f.get("firmware_ids") or [])
+                if old_fw_id in id_map
+            ]
+            if new_fw_ids:
+                fw_rows = (
+                    await self.db.execute(
+                        select(Firmware).where(Firmware.id.in_(new_fw_ids))
+                    )
+                ).scalars().all()
+                finding.firmware_versions = list(fw_rows)
             self.db.add(finding)
 
     # ── Documents ──────────────────────────────────────────────────

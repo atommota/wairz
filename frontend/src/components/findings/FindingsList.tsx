@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import type { Finding, Severity, FindingStatus, FindingSource } from '@/types'
+import type { Finding, Severity, FindingStatus, FindingSource, FirmwareDetail } from '@/types'
 import { formatDate } from '@/utils/format'
 
 const SEVERITY_CONFIG: Record<Severity, { icon: React.ElementType; className: string; order: number }> = {
@@ -48,9 +48,16 @@ interface FindingsListProps {
   severityFilter: Severity | null
   statusFilter: FindingStatus | null
   sourceFilter: FindingSource | null
+  firmwareVersions: FirmwareDetail[]
+  firmwareFilter: string | null
   onSeverityFilter: (s: Severity | null) => void
   onStatusFilter: (s: FindingStatus | null) => void
   onSourceFilter: (s: FindingSource | null) => void
+  onFirmwareFilter: (id: string | null) => void
+}
+
+function firmwareLabel(fw: { version_label: string | null; original_filename: string | null; id: string }): string {
+  return fw.version_label || fw.original_filename || fw.id.slice(0, 8)
 }
 
 type SortField = 'severity' | 'created_at'
@@ -63,9 +70,12 @@ export default function FindingsList({
   severityFilter,
   statusFilter,
   sourceFilter,
+  firmwareVersions,
+  firmwareFilter,
   onSeverityFilter,
   onStatusFilter,
   onSourceFilter,
+  onFirmwareFilter,
 }: FindingsListProps) {
   const [sortField, setSortField] = useState<SortField>('severity')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
@@ -160,6 +170,24 @@ export default function FindingsList({
             </button>
           )
         })}
+
+        {firmwareVersions.length > 0 && (
+          <>
+            <span className="ml-2 text-xs text-muted-foreground">Version:</span>
+            <select
+              value={firmwareFilter ?? ''}
+              onChange={(e) => onFirmwareFilter(e.target.value || null)}
+              className="rounded-full border border-border bg-transparent px-2 py-0.5 text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <option value="">All versions</option>
+              {firmwareVersions.map((fw) => (
+                <option key={fw.id} value={fw.id}>
+                  {firmwareLabel(fw)}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
       </div>
 
       {/* Sort controls */}
@@ -232,6 +260,19 @@ export default function FindingsList({
                       )
                     })()}
                   </div>
+                  {f.firmware_versions.length > 0 && (
+                    <div className="mt-1 flex flex-wrap items-center gap-1">
+                      {f.firmware_versions.map((fw) => (
+                        <Badge
+                          key={fw.id}
+                          variant="outline"
+                          className="border-indigo-500/40 text-[10px] text-indigo-600 dark:text-indigo-400"
+                        >
+                          {firmwareLabel(fw)}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
                   <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
                     {f.file_path && (
                       <span className="truncate font-mono">{f.file_path}</span>

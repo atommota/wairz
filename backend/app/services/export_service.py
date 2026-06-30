@@ -224,6 +224,7 @@ class ExportService:
                 "cwe_ids": f.cwe_ids,
                 "status": f.status,
                 "source": f.source,
+                "firmware_ids": [str(fw.id) for fw in f.firmware_versions],
                 "created_at": f.created_at,
                 "updated_at": f.updated_at,
             }

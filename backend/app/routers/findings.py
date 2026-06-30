@@ -43,11 +43,19 @@ async def list_findings(
     project_id: uuid.UUID,
     severity: str | None = Query(None),
     status: str | None = Query(None),
+    source: str | None = Query(None),
+    firmware_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     await _get_project_or_404(project_id, db)
     svc = FindingService(db)
-    return await svc.list_by_project(project_id, severity=severity, status=status)
+    return await svc.list_by_project(
+        project_id,
+        severity=severity,
+        status=status,
+        source=source,
+        firmware_id=firmware_id,
+    )
 
 
 @router.get("/{finding_id}", response_model=FindingResponse)
@@ -103,9 +111,13 @@ async def export_findings(
 ):
     project = await _get_project_or_404(project_id, db)
 
-    # Load firmware
+    # Load firmware — a project may have several versions, so pick the latest
+    # for the report header (scalar_one_or_none would raise on >1 row).
     fw_result = await db.execute(
-        select(Firmware).where(Firmware.project_id == project_id)
+        select(Firmware)
+        .where(Firmware.project_id == project_id)
+        .order_by(Firmware.created_at.desc())
+        .limit(1)
     )
     firmware = fw_result.scalar_one_or_none()
 
