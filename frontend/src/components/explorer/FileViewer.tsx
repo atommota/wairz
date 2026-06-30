@@ -96,7 +96,7 @@ export default function FileViewer() {
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : fileContent ? (
-          <div className="flex-1">
+          <div className="min-h-0 flex-1">
             <Editor
               language={getDocumentLanguage(filename)}
               value={displayContent}
@@ -540,7 +540,7 @@ function DisassemblyPanel({
       <div className="border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
         Disassembly of <span className="font-mono text-foreground">{functionName}</span>
       </div>
-      <div className="flex-1">
+      <div className="min-h-0 flex-1">
         <Editor
           language="assembly"
           value={disassembly}
@@ -648,7 +648,7 @@ function DecompilationPanel({
         </div>
       </div>
 
-      <div className="flex-1">
+      <div className="min-h-0 flex-1">
         {decompileView === 'raw' ? (
           <Editor
             language="c"
@@ -747,7 +747,7 @@ function TextTabs({
               File content truncated. Only a portion of the file is shown.
             </div>
           )}
-          <div className="flex-1">
+          <div className="min-h-0 flex-1">
             <Editor
               language={getMonacoLanguage(selectedNode?.name ?? '', fileContent.content)}
               value={fileContent.content}
