@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
+import { useProjectStore } from '@/stores/projectStore'
 import {
   Package,
   ShieldAlert,
@@ -78,7 +79,8 @@ type Tab = 'components' | 'vulnerabilities'
 
 export default function SbomPage() {
   const { projectId } = useParams<{ projectId: string }>()
-
+  const activeFirmwareId = useProjectStore((s) => s.activeFirmwareId)
+  const fw = activeFirmwareId ?? undefined
 
   const [tab, setTab] = useState<Tab>('components')
   const [components, setComponents] = useState<SbomComponent[]>([])
@@ -106,8 +108,8 @@ export default function SbomPage() {
     setLoading(true)
     try {
       const [comps, summary] = await Promise.all([
-        getSbomComponents(projectId).catch(() => []),
-        getVulnerabilitySummary(projectId).catch(() => null),
+        getSbomComponents(projectId, undefined, fw).catch(() => []),
+        getVulnerabilitySummary(projectId, fw).catch(() => null),
       ])
       setComponents(comps)
       setSummary(summary)
@@ -117,13 +119,13 @@ export default function SbomPage() {
         if (resolutionFilter !== 'all') {
           filters.resolution_status = resolutionFilter
         }
-        const vulns = await getVulnerabilities(projectId, filters).catch(() => [])
+        const vulns = await getVulnerabilities(projectId, filters, fw).catch(() => [])
         setVulnerabilities(vulns)
       }
     } finally {
       setLoading(false)
     }
-  }, [projectId, resolutionFilter])
+  }, [projectId, resolutionFilter, fw])
 
   useEffect(() => {
     loadData()
@@ -136,11 +138,11 @@ export default function SbomPage() {
     if (resolutionFilter !== 'all') {
       filters.resolution_status = resolutionFilter
     }
-    const vulns = await getVulnerabilities(projectId, filters).catch(() => [])
+    const vulns = await getVulnerabilities(projectId, filters, fw).catch(() => [])
     setVulnerabilities(vulns)
-    const s = await getVulnerabilitySummary(projectId).catch(() => null)
+    const s = await getVulnerabilitySummary(projectId, fw).catch(() => null)
     setSummary(s)
-  }, [projectId, resolutionFilter])
+  }, [projectId, resolutionFilter, fw])
 
   // Handle resolution status update
   const handleResolve = useCallback(async (vulnId: string, status: VulnerabilityResolutionStatus, justification?: string) => {
@@ -164,17 +166,17 @@ export default function SbomPage() {
     if (!projectId) return
     setGenerating(true)
     try {
-      const result = await generateSbom(projectId, force)
+      const result = await generateSbom(projectId, force, fw)
       setComponents(result.components)
       // Reload summary
-      const s = await getVulnerabilitySummary(projectId).catch(() => null)
+      const s = await getVulnerabilitySummary(projectId, fw).catch(() => null)
       setSummary(s)
     } catch (err) {
       console.error('SBOM generation failed:', err)
     } finally {
       setGenerating(false)
     }
-  }, [projectId])
+  }, [projectId, fw])
 
   // Run vulnerability scan
   const handleScan = useCallback(async (force = false) => {
@@ -182,13 +184,13 @@ export default function SbomPage() {
     setScanning(true)
     setScanResult(null)
     try {
-      const result = await runVulnerabilityScan(projectId, force)
+      const result = await runVulnerabilityScan(projectId, force, fw)
       setScanResult(result)
       // Reload data
       const [vulns, comps, s] = await Promise.all([
-        getVulnerabilities(projectId),
-        getSbomComponents(projectId),
-        getVulnerabilitySummary(projectId),
+        getVulnerabilities(projectId, undefined, fw),
+        getSbomComponents(projectId, undefined, fw),
+        getVulnerabilitySummary(projectId, fw),
       ])
       setVulnerabilities(vulns)
       setComponents(comps)
@@ -198,13 +200,13 @@ export default function SbomPage() {
     } finally {
       setScanning(false)
     }
-  }, [projectId])
+  }, [projectId, fw])
 
   // Export SBOM
   const handleExport = useCallback(async () => {
     if (!projectId) return
     try {
-      const blob = await exportSbom(projectId)
+      const blob = await exportSbom(projectId, undefined, fw)
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -214,7 +216,7 @@ export default function SbomPage() {
     } catch (err) {
       console.error('SBOM export failed:', err)
     }
-  }, [projectId])
+  }, [projectId, fw])
 
   // Filter components
   const filteredComponents = components.filter((c) => {

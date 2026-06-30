@@ -30,6 +30,10 @@ export interface FirmwareSummary {
   firmware_kind: FirmwareKind
   firmware_kind_source: FirmwareKindSource | null
   rtos_flavor: RtosFlavor | null
+  // Present on the project-detail firmware list; used to tell whether a
+  // version is browsable and to default the active-version picker.
+  extracted_path?: string | null
+  storage_path?: string | null
   created_at: string
 }
 

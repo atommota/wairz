@@ -31,6 +31,7 @@ import {
   getCrashDetail,
 } from '@/api/fuzzing'
 import { createFinding } from '@/api/findings'
+import { useProjectStore } from '@/stores/projectStore'
 import type {
   FuzzingCampaign,
   FuzzingCrash,
@@ -57,6 +58,7 @@ const EXPLOIT_CONFIG: Record<CrashExploitability, { label: string; className: st
 
 export default function FuzzingPage() {
   const { projectId } = useParams<{ projectId: string }>()
+  const activeFirmwareId = useProjectStore((s) => s.activeFirmwareId)
 
   const [campaigns, setCampaigns] = useState<FuzzingCampaign[]>([])
   const [loading, setLoading] = useState(true)
@@ -139,7 +141,7 @@ export default function FuzzingPage() {
     setAnalyzing(true)
     setAnalysis(null)
     try {
-      const result = await analyzeTarget(projectId, binaryPath.trim())
+      const result = await analyzeTarget(projectId, binaryPath.trim(), activeFirmwareId ?? undefined)
       setAnalysis(result)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Analysis failed'
@@ -163,7 +165,7 @@ export default function FuzzingPage() {
         binary_path: binaryPath.trim(),
         timeout_per_exec: timeoutPerExec,
         memory_limit: memoryLimit,
-      })
+      }, activeFirmwareId ?? undefined)
       // Auto-start
       const started = await startCampaign(projectId, campaign.id)
       setSelectedId(started.id)

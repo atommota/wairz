@@ -14,6 +14,7 @@ from app.schemas.project import (
     ProjectUpdate,
 )
 from app.services.document_service import DocumentService
+from app.utils.firmware_selection import pick_active_firmware
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
 
@@ -82,9 +83,10 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
     projects = result.scalars().all()
     out = []
     for p in projects:
-        # Use the most recently uploaded firmware as the "active" one —
-        # matches the MCP server's default-firmware selection.
-        active_fw = max(p.firmware, key=lambda f: f.created_at) if p.firmware else None
+        # Use the most recent *loadable* firmware as the "active" one, so a
+        # newer upload that failed to unpack doesn't hide the analysis tabs of
+        # an older working version.
+        active_fw = pick_active_firmware(p.firmware)
         out.append(
             ProjectListResponse(
                 id=p.id,

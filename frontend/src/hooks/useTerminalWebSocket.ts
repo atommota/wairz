@@ -4,12 +4,14 @@ import { buildTerminalWebSocketURL } from '@/api/terminal'
 
 interface UseTerminalWebSocketOptions {
   projectId: string | undefined
+  firmwareId?: string | null
   terminal: Terminal | null
   isOpen: boolean
 }
 
 export function useTerminalWebSocket({
   projectId,
+  firmwareId,
   terminal,
   isOpen,
 }: UseTerminalWebSocketOptions) {
@@ -31,7 +33,7 @@ export function useTerminalWebSocket({
 
     // The WS URL is built asynchronously (it awaits the auth token), so connect
     // inside a promise and guard against the effect being torn down meanwhile.
-    void buildTerminalWebSocketURL(projectId).then((url) => {
+    void buildTerminalWebSocketURL(projectId, firmwareId ?? undefined).then((url) => {
       if (disposed) return
       const ws = new WebSocket(url)
       wsRef.current = ws
@@ -80,7 +82,7 @@ export function useTerminalWebSocket({
       }
       wsRef.current = null
     }
-  }, [isOpen, projectId, terminal, sendResize])
+  }, [isOpen, projectId, firmwareId, terminal, sendResize])
 
   return { sendResize }
 }
