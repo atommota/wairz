@@ -20,6 +20,16 @@ class FindingStatus(str, Enum):
     fixed = "fixed"
 
 
+class FirmwareVersionRef(BaseModel):
+    """Lightweight reference to a firmware version a finding is tagged with."""
+
+    model_config = {"from_attributes": True}
+
+    id: uuid.UUID
+    version_label: str | None
+    original_filename: str | None
+
+
 class FindingCreate(BaseModel):
     title: str
     severity: Severity
@@ -32,6 +42,10 @@ class FindingCreate(BaseModel):
     conversation_id: uuid.UUID | None = None
     source: str = "manual"
     component_id: uuid.UUID | None = None
+    # Firmware version(s) the finding affects. When omitted/empty the service
+    # defaults to the project's latest-uploaded firmware so every finding is
+    # tagged with at least one version.
+    firmware_ids: list[uuid.UUID] | None = None
 
 
 class FindingUpdate(BaseModel):
@@ -45,6 +59,9 @@ class FindingUpdate(BaseModel):
     cwe_ids: list[str] | None = None
     status: FindingStatus | None = None
     source: str | None = None
+    # When provided, replaces the finding's set of tagged firmware versions.
+    # Omit to leave the existing tags unchanged.
+    firmware_ids: list[uuid.UUID] | None = None
 
 
 class FindingResponse(BaseModel):
@@ -64,5 +81,6 @@ class FindingResponse(BaseModel):
     status: str
     source: str
     component_id: uuid.UUID | None
+    firmware_versions: list[FirmwareVersionRef] = []
     created_at: datetime
     updated_at: datetime

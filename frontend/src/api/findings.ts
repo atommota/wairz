@@ -3,7 +3,7 @@ import type { Finding, FindingCreate, FindingUpdate } from '@/types'
 
 export async function listFindings(
   projectId: string,
-  params?: { severity?: string; status?: string },
+  params?: { severity?: string; status?: string; source?: string; firmware_id?: string },
 ): Promise<Finding[]> {
   const { data } = await apiClient.get<Finding[]>(
     `/projects/${projectId}/findings`,

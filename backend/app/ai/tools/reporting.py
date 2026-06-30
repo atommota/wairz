@@ -1,7 +1,42 @@
+import uuid
+
+from sqlalchemy import select
+
 from app.ai.tool_registry import ToolContext, ToolRegistry
 from app.models.finding import Finding
+from app.models.firmware import Firmware
 from app.schemas.finding import FindingCreate, FindingUpdate, Severity, FindingStatus
 from app.services.finding_service import FindingService
+
+
+async def _resolve_firmware_refs(
+    context: ToolContext, refs: list[str]
+) -> list[uuid.UUID]:
+    """Map firmware references (UUIDs or version labels) to firmware UUIDs.
+
+    References are resolved against the active project's firmware. Labels match
+    case-insensitively; entries that resolve to nothing are skipped.
+    """
+    result = await context.db.execute(
+        select(Firmware).where(Firmware.project_id == context.project_id)
+    )
+    firmware = list(result.scalars().all())
+    by_id = {str(fw.id): fw.id for fw in firmware}
+    by_label = {
+        (fw.version_label or "").strip().lower(): fw.id
+        for fw in firmware
+        if fw.version_label
+    }
+    resolved: list[uuid.UUID] = []
+    for ref in refs:
+        key = str(ref).strip()
+        if key in by_id:
+            resolved.append(by_id[key])
+        elif key.lower() in by_label:
+            resolved.append(by_label[key.lower()])
+    # De-duplicate while preserving order.
+    seen: set[uuid.UUID] = set()
+    return [fid for fid in resolved if not (fid in seen or seen.add(fid))]
 
 
 def register_reporting_tools(registry: ToolRegistry) -> None:
@@ -54,6 +89,16 @@ def register_reporting_tools(registry: ToolRegistry) -> None:
                     "type": "string",
                     "enum": ["ai_discovered", "manual", "sbom_scan", "fuzzing", "security_review"],
                     "description": "How this finding was discovered (default: ai_discovered)",
+                },
+                "firmware_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Firmware version(s) this finding affects — each entry may be a "
+                        "firmware UUID or a version label (e.g. 'V1'). If omitted, the "
+                        "finding is tagged with the currently-active firmware version. "
+                        "Use list_firmware_versions to see available versions."
+                    ),
                 },
             },
             "required": ["title", "severity", "description"],
@@ -109,10 +154,11 @@ def register_reporting_tools(registry: ToolRegistry) -> None:
     registry.register(
         name="update_finding",
         description=(
-            "Update an existing finding's severity, status, or details. "
-            "Use this to re-rate severity after further analysis, "
-            "mark findings as confirmed/false_positive/fixed, "
-            "or refine the description/evidence."
+            "Update an existing finding's severity, status, details, or the firmware "
+            "version(s) it affects. Use this to re-rate severity after further analysis, "
+            "mark findings as confirmed/false_positive/fixed, refine the "
+            "description/evidence, or tag additional firmware versions when a "
+            "vulnerability is still present in a newer release."
         ),
         input_schema={
             "type": "object",
@@ -139,6 +185,17 @@ def register_reporting_tools(registry: ToolRegistry) -> None:
                     "type": "string",
                     "description": "Updated or additional evidence",
                 },
+                "firmware_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Replaces the set of firmware version(s) this finding affects. "
+                        "Each entry may be a firmware UUID or version label (e.g. 'V2'). "
+                        "To add a newly-released version while keeping existing tags, "
+                        "pass the full desired set (old + new). Use list_firmware_versions "
+                        "to see available versions."
+                    ),
+                },
             },
             "required": ["finding_id"],
         },
@@ -148,6 +205,12 @@ def register_reporting_tools(registry: ToolRegistry) -> None:
 
 async def _handle_add_finding(input: dict, context: ToolContext) -> str:
     svc = FindingService(context.db)
+    # Resolve firmware version tags. When the caller doesn't specify any, tag
+    # the finding with the currently-active firmware version.
+    if "firmware_ids" in input:
+        firmware_ids = await _resolve_firmware_refs(context, input["firmware_ids"])
+    else:
+        firmware_ids = [context.firmware_id]
     data = FindingCreate(
         title=input["title"],
         severity=Severity(input["severity"]),
@@ -158,12 +221,17 @@ async def _handle_add_finding(input: dict, context: ToolContext) -> str:
         cve_ids=input.get("cve_ids"),
         cwe_ids=input.get("cwe_ids"),
         source=input.get("source", "ai_discovered"),
+        firmware_ids=firmware_ids,
     )
     finding = await svc.create(context.project_id, data)
     await context.db.commit()
+    versions = ", ".join(
+        fw.version_label or str(fw.id)[:8] for fw in finding.firmware_versions
+    )
+    version_str = f" — version(s): {versions}" if versions else ""
     return (
         f"Finding recorded: {finding.title} [{finding.severity}] "
-        f"(ID: {finding.id})"
+        f"(ID: {finding.id}){version_str}"
     )
 
 
@@ -181,8 +249,12 @@ async def _handle_list_findings(input: dict, context: ToolContext) -> str:
     for f in findings:
         status_badge = f"[{f.status}]" if f.status != "open" else ""
         file_info = f" in {f.file_path}" if f.file_path else ""
+        versions = ", ".join(
+            fw.version_label or str(fw.id)[:8] for fw in f.firmware_versions
+        )
+        version_info = f" {{{versions}}}" if versions else ""
         lines.append(
-            f"- [{f.severity.upper()}] {f.title}{file_info} {status_badge} (ID: {f.id})"
+            f"- [{f.severity.upper()}] {f.title}{file_info}{version_info} {status_badge} (ID: {f.id})"
         )
     return "\n".join(lines)
 
@@ -216,6 +288,12 @@ async def _handle_get_finding(input: dict, context: ToolContext) -> str:
         lines.append(f"- CVEs: {', '.join(finding.cve_ids)}")
     if finding.cwe_ids:
         lines.append(f"- CWEs: {', '.join(finding.cwe_ids)}")
+    if finding.firmware_versions:
+        versions = ", ".join(
+            f"{fw.version_label or 'unlabeled'} ({str(fw.id)[:8]})"
+            for fw in finding.firmware_versions
+        )
+        lines.append(f"- Affected version(s): {versions}")
     lines.append(f"- Created: {finding.created_at}")
     lines.append(f"- Updated: {finding.updated_at}")
     lines.append("")
@@ -246,6 +324,10 @@ async def _handle_update_finding(input: dict, context: ToolContext) -> str:
         update_fields["description"] = input["description"]
     if "evidence" in input:
         update_fields["evidence"] = input["evidence"]
+    if "firmware_ids" in input:
+        update_fields["firmware_ids"] = await _resolve_firmware_refs(
+            context, input["firmware_ids"]
+        )
 
     if not update_fields:
         return "No fields to update."
@@ -253,4 +335,11 @@ async def _handle_update_finding(input: dict, context: ToolContext) -> str:
     data = FindingUpdate(**update_fields)
     updated = await svc.update(finding_id, data)
     await context.db.commit()
-    return f"Finding updated: {updated.title} [{updated.severity}] — status: {updated.status}"
+    versions = ", ".join(
+        fw.version_label or str(fw.id)[:8] for fw in updated.firmware_versions
+    )
+    version_str = f" — version(s): {versions}" if versions else ""
+    return (
+        f"Finding updated: {updated.title} [{updated.severity}] "
+        f"— status: {updated.status}{version_str}"
+    )

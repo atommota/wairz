@@ -1,10 +1,29 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ARRAY, ForeignKey, Integer, String, Text, func
+from sqlalchemy import ARRAY, Column, ForeignKey, Integer, String, Table, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+
+# Association table linking findings to the firmware version(s) they affect.
+# A finding may apply to multiple versions (e.g. a vuln still present after an
+# update), and a version may have many findings — hence many-to-many.
+finding_firmware = Table(
+    "finding_firmware",
+    Base.metadata,
+    Column(
+        "finding_id",
+        ForeignKey("findings.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "firmware_id",
+        ForeignKey("firmware.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
 
 
 class Finding(Base):
@@ -42,3 +61,8 @@ class Finding(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     project: Mapped["Project"] = relationship(back_populates="findings")  # noqa: F821
+    firmware_versions: Mapped[list["Firmware"]] = relationship(  # noqa: F821
+        secondary=finding_firmware,
+        lazy="selectin",
+        order_by="Firmware.created_at",
+    )
