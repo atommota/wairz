@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { ShieldAlert, Loader2 } from 'lucide-react'
 import { listFindings, updateFinding, deleteFinding } from '@/api/findings'
 import { listFirmware } from '@/api/firmware'
+import { useProjectStore } from '@/stores/projectStore'
 import type { Finding, FindingUpdate, Severity, FindingStatus, FindingSource, FirmwareDetail } from '@/types'
 import FindingsList from '@/components/findings/FindingsList'
 import FindingDetail from '@/components/findings/FindingDetail'
@@ -10,6 +11,7 @@ import ReportExport from '@/components/findings/ReportExport'
 
 export default function FindingsPage() {
   const { projectId } = useParams<{ projectId: string }>()
+  const activeFirmwareId = useProjectStore((s) => s.activeFirmwareId)
 
   const [findings, setFindings] = useState<Finding[]>([])
   const [firmwareVersions, setFirmwareVersions] = useState<FirmwareDetail[]>([])
@@ -47,6 +49,12 @@ export default function FindingsPage() {
       .then(setFirmwareVersions)
       .catch((err) => console.error('Failed to load firmware versions:', err))
   }, [projectId])
+
+  // Default the findings view to the globally-selected firmware version. Users
+  // can still widen to "All versions" via the in-list filter afterward.
+  useEffect(() => {
+    setFirmwareFilter(activeFirmwareId)
+  }, [activeFirmwareId])
 
   const handleSelect = useCallback((finding: Finding) => {
     setSelectedId((prev) => (prev === finding.id ? null : finding.id))

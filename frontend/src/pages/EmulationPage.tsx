@@ -35,6 +35,7 @@ import {
   deletePreset,
 } from '@/api/emulation'
 import { listFirmware } from '@/api/firmware'
+import { useProjectStore } from '@/stores/projectStore'
 import KernelManager from '@/components/emulation/KernelManager'
 import type {
   EmulationSession,
@@ -57,6 +58,7 @@ const STATUS_CONFIG: Record<EmulationStatus, { label: string; className: string 
 
 export default function EmulationPage() {
   const { projectId } = useParams<{ projectId: string }>()
+  const activeFirmwareId = useProjectStore((s) => s.activeFirmwareId)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [sessions, setSessions] = useState<EmulationSession[]>([])
@@ -138,14 +140,15 @@ export default function EmulationPage() {
     if (!projectId) return
     listFirmware(projectId)
       .then((fwList) => {
-        const fw = fwList[0]
+        // Use the active version's arch/kernel, not just the first upload.
+        const fw = fwList.find((f) => f.id === activeFirmwareId) ?? fwList[0]
         if (fw) {
           setFirmwareArch(fw.architecture ?? null)
           setFirmwareKernelPath(fw.kernel_path ?? null)
         }
       })
       .catch(() => {})
-  }, [projectId])
+  }, [projectId, activeFirmwareId])
 
   // Poll for status updates (faster during active sessions)
   useEffect(() => {
@@ -177,7 +180,7 @@ export default function EmulationPage() {
         init_path: mode === 'system' && initPath.trim() ? initPath.trim() : undefined,
         pre_init_script: mode === 'system' && preInitScript.trim() ? preInitScript.trim() : undefined,
         stub_profile: mode === 'system' && stubProfile !== 'none' ? stubProfile : undefined,
-      })
+      }, activeFirmwareId ?? undefined)
       setActiveSession(session)
       if (session.status === 'running' || session.status === 'error') {
         setShowTerminal(session.status === 'running')

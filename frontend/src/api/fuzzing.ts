@@ -10,10 +10,11 @@ import type {
 export async function analyzeTarget(
   projectId: string,
   path: string,
+  firmwareId?: string,
 ): Promise<FuzzingTargetAnalysis> {
   const { data } = await apiClient.get<FuzzingTargetAnalysis>(
     `/projects/${projectId}/fuzzing/analyze`,
-    { params: { path } },
+    { params: { path, firmware_id: firmwareId } },
   )
   return data
 }
@@ -21,10 +22,12 @@ export async function analyzeTarget(
 export async function createCampaign(
   projectId: string,
   request: FuzzingCampaignCreateRequest,
+  firmwareId?: string,
 ): Promise<FuzzingCampaign> {
   const { data } = await apiClient.post<FuzzingCampaign>(
     `/projects/${projectId}/fuzzing/campaigns`,
     request,
+    { params: { firmware_id: firmwareId } },
   )
   return data
 }

@@ -215,6 +215,7 @@ function BinaryTabs({
   isElf: boolean
   infoLoading: boolean
 }) {
+  const firmwareId = useExplorerStore((s) => s.firmwareId)
   const [functions, setFunctions] = useState<FunctionInfo[]>([])
   const [imports, setImports] = useState<ImportInfo[]>([])
   const [functionsLoading, setFunctionsLoading] = useState(false)
@@ -253,8 +254,8 @@ function BinaryTabs({
         setFunctionsLoading(true)
         setFunctionsError(null)
         Promise.all([
-          listFunctions(projectId, filePath),
-          listImports(projectId, filePath).catch(() => ({ imports: [] as ImportInfo[] })),
+          listFunctions(projectId, filePath, firmwareId ?? undefined),
+          listImports(projectId, filePath, firmwareId ?? undefined).catch(() => ({ imports: [] as ImportInfo[] })),
         ])
           .then(([funcResp, impResp]) => {
             setFunctions(funcResp.functions)
@@ -279,11 +280,11 @@ function BinaryTabs({
         setDecompilationLoading(true)
         setCleanedCode(null)
         setCleanedCodeChecked(false)
-        decompileFunction(projectId, filePath, selectedFunction)
+        decompileFunction(projectId, filePath, selectedFunction, firmwareId ?? undefined)
           .then((resp) => setDecompilation(resp.decompiled_code))
           .catch(() => setDecompilation('Decompilation failed.'))
           .finally(() => setDecompilationLoading(false))
-        fetchCleanedCode(projectId, filePath, selectedFunction)
+        fetchCleanedCode(projectId, filePath, selectedFunction, firmwareId ?? undefined)
           .then((resp) => {
             setCleanedCode(resp.available ? resp.cleaned_code : null)
             setCleanedCodeChecked(true)
@@ -291,7 +292,7 @@ function BinaryTabs({
           .catch(() => setCleanedCodeChecked(true))
       }
     },
-    [projectId, filePath, functionsLoaded, functionsLoading, isElf, selectedFunction, decompilationFunction],
+    [projectId, filePath, functionsLoaded, functionsLoading, isElf, selectedFunction, decompilationFunction, firmwareId],
   )
 
   // Load disassembly when a function is selected
@@ -301,12 +302,12 @@ function BinaryTabs({
       setDisasm(null)
       setDisasmLoading(true)
       setActiveTab('disasm')
-      disassembleFunction(projectId, filePath, funcName)
+      disassembleFunction(projectId, filePath, funcName, 100, firmwareId ?? undefined)
         .then((resp) => setDisasm(resp.disassembly))
         .catch(() => setDisasm('Failed to disassemble function.'))
         .finally(() => setDisasmLoading(false))
     },
-    [projectId, filePath],
+    [projectId, filePath, firmwareId],
   )
 
   return (

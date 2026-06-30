@@ -11,11 +11,12 @@ import type {
 export async function generateSbom(
   projectId: string,
   forceRescan = false,
+  firmwareId?: string,
 ): Promise<SbomGenerateResponse> {
   const { data } = await apiClient.post<SbomGenerateResponse>(
     `/projects/${projectId}/sbom/generate`,
     null,
-    { params: { force_rescan: forceRescan } },
+    { params: { force_rescan: forceRescan, firmware_id: firmwareId } },
   )
   return data
 }
@@ -23,10 +24,11 @@ export async function generateSbom(
 export async function getSbomComponents(
   projectId: string,
   filters?: { type?: string; name?: string },
+  firmwareId?: string,
 ): Promise<SbomComponent[]> {
   const { data } = await apiClient.get<SbomComponent[]>(
     `/projects/${projectId}/sbom`,
-    { params: filters },
+    { params: { ...filters, firmware_id: firmwareId } },
   )
   return data
 }
@@ -34,10 +36,11 @@ export async function getSbomComponents(
 export async function exportSbom(
   projectId: string,
   format = 'cyclonedx-json',
+  firmwareId?: string,
 ): Promise<Blob> {
   const { data } = await apiClient.get(
     `/projects/${projectId}/sbom/export`,
-    { params: { format }, responseType: 'blob' },
+    { params: { format, firmware_id: firmwareId }, responseType: 'blob' },
   )
   return data
 }
@@ -45,11 +48,12 @@ export async function exportSbom(
 export async function runVulnerabilityScan(
   projectId: string,
   forceRescan = false,
+  firmwareId?: string,
 ): Promise<VulnerabilityScanResult> {
   const { data } = await apiClient.post<VulnerabilityScanResult>(
     `/projects/${projectId}/sbom/vulnerabilities/scan`,
     null,
-    { params: { force_rescan: forceRescan } },
+    { params: { force_rescan: forceRescan, firmware_id: firmwareId } },
   )
   return data
 }
@@ -57,10 +61,11 @@ export async function runVulnerabilityScan(
 export async function getVulnerabilities(
   projectId: string,
   filters?: { severity?: string; component_id?: string; cve_id?: string; resolution_status?: string },
+  firmwareId?: string,
 ): Promise<SbomVulnerability[]> {
   const { data } = await apiClient.get<SbomVulnerability[]>(
     `/projects/${projectId}/sbom/vulnerabilities`,
-    { params: filters },
+    { params: { ...filters, firmware_id: firmwareId } },
   )
   return data
 }
@@ -79,9 +84,11 @@ export async function updateVulnerability(
 
 export async function getVulnerabilitySummary(
   projectId: string,
+  firmwareId?: string,
 ): Promise<SbomSummary> {
   const { data } = await apiClient.get<SbomSummary>(
     `/projects/${projectId}/sbom/vulnerabilities/summary`,
+    { params: { firmware_id: firmwareId } },
   )
   return data
 }

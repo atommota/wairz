@@ -2,11 +2,13 @@ import { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { Loader2, AlertTriangle } from 'lucide-react'
 import { getComponentMap } from '@/api/componentMap'
+import { useProjectStore } from '@/stores/projectStore'
 import type { ComponentGraph } from '@/types'
 import ComponentMap from '@/components/component-map/ComponentMap'
 
 export default function ComponentMapPage() {
   const { projectId } = useParams<{ projectId: string }>()
+  const activeFirmwareId = useProjectStore((s) => s.activeFirmwareId)
   const [graph, setGraph] = useState<ComponentGraph | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -18,7 +20,7 @@ export default function ComponentMapPage() {
     setLoading(true)
     setError(null)
 
-    getComponentMap(projectId)
+    getComponentMap(projectId, activeFirmwareId ?? undefined)
       .then((data) => {
         if (!cancelled) setGraph(data)
       })
@@ -35,7 +37,7 @@ export default function ComponentMapPage() {
     return () => {
       cancelled = true
     }
-  }, [projectId])
+  }, [projectId, activeFirmwareId])
 
   if (loading) {
     return (
